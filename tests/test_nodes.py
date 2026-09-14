@@ -29,6 +29,10 @@ def nodes_module(monkeypatch, comfy):
             "qwen_3_8b_fp8mixed.safetensors",
             "cvrr/cvrr_qwen3vl_8b-00001.safetensors",
             "cvrr/cvrr_merged_transition.safetensors",
+            # deliberately un-CVRR-sounding names: the transition file may be
+            # called anything and live in any text_encoders subfolder
+            "custom/adapter_v1.safetensors",
+            "cvrr/cvrr_qwen3vl8b_adapter_fp32.safetensors",
         ],
     }
     folder_paths.get_filename_list = lambda folder: list(model_files.get(folder, []))
@@ -116,8 +120,8 @@ def test_parse_tap_gains(nodes_module):
         nodes_module._parse_gains("1,2", spec)
 
 
-def test_example_workflow_matches_node_schemas(nodes_module):
-    """The shipped example graph must feed every node the way ComfyUI will.
+def test_example_workflows_match_node_schemas(nodes_module):
+    """The shipped example graphs must feed every node the way ComfyUI will.
 
     ComfyUI assigns widget values positionally (required first, then optional),
     so a stale example graph is a silent mis-wiring rather than an error.
@@ -126,41 +130,44 @@ def test_example_workflow_matches_node_schemas(nodes_module):
     import pathlib
 
     nodes = nodes_module
-    path = pathlib.Path(__file__).resolve().parents[1] / "examples" / "klein9b_cvrr_edit.json"
-    graph = json.loads(path.read_text())
+    examples = pathlib.Path(__file__).resolve().parents[1] / "examples"
+    files = sorted(examples.glob("*.json"))
+    assert files, "no example workflows shipped"
 
     link_types = {"MODEL", "CLIP", "VAE", "CONDITIONING", "LATENT", "IMAGE", "MASK"}
-    checked = 0
-    for node in graph["nodes"]:
-        cls = nodes.NODE_CLASS_MAPPINGS.get(node["type"])
-        if cls is None:
-            continue  # a core ComfyUI node
-        checked += 1
-        schema = cls.INPUT_TYPES()
-        declared = {}
-        for section in ("required", "optional"):
-            declared.update(schema.get(section, {}))
+    for path in files:
+        graph = json.loads(path.read_text())
+        checked = 0
+        for node in graph["nodes"]:
+            cls = nodes.NODE_CLASS_MAPPINGS.get(node["type"])
+            if cls is None:
+                continue  # a core ComfyUI node
+            checked += 1
+            schema = cls.INPUT_TYPES()
+            declared = {}
+            for section in ("required", "optional"):
+                declared.update(schema.get(section, {}))
 
-        for entry in node.get("inputs", []):
-            assert entry["name"] in declared, f"{node['type']}: unknown input {entry['name']}"
+            for entry in node.get("inputs", []):
+                assert entry["name"] in declared, f"{path.name}/{node['type']}: unknown input {entry['name']}"
 
-        widgets = [name for name, spec in declared.items()
-                   if not (isinstance(spec[0], str) and spec[0] in link_types)]
-        assert len(node["widgets_values"]) == len(widgets), (
-            f"{node['type']}: {len(node['widgets_values'])} widget values for {widgets}"
-        )
-        for value, name in zip(node["widgets_values"], widgets):
-            options = declared[name][0]
-            if isinstance(options, list):
-                assert value in options, f"{node['type']}.{name}: {value!r} not in {options}"
-            elif options == "INT":
-                assert isinstance(value, int), f"{node['type']}.{name}"
-            elif options == "FLOAT":
-                assert isinstance(value, (int, float)), f"{node['type']}.{name}"
-            elif options == "STRING":
-                assert isinstance(value, str), f"{node['type']}.{name}"
+            widgets = [name for name, spec in declared.items()
+                       if not (isinstance(spec[0], str) and spec[0] in link_types)]
+            assert len(node["widgets_values"]) == len(widgets), (
+                f"{path.name}/{node['type']}: {len(node['widgets_values'])} widget values for {widgets}"
+            )
+            for value, name in zip(node["widgets_values"], widgets):
+                options = declared[name][0]
+                if isinstance(options, list):
+                    assert value in options, f"{path.name}/{node['type']}.{name}: {value!r} not in {options}"
+                elif options == "INT":
+                    assert isinstance(value, int), f"{path.name}/{node['type']}.{name}"
+                elif options == "FLOAT":
+                    assert isinstance(value, (int, float)), f"{path.name}/{node['type']}.{name}"
+                elif options == "STRING":
+                    assert isinstance(value, str), f"{path.name}/{node['type']}.{name}"
 
-    assert checked >= 2, "example workflow no longer references any CVRR node"
+        assert checked >= 1, f"{path.name}: references no CVRR node"
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +206,11 @@ def _stock_tiny_clip(comfy, seed=1234):
     return clip
 
 
+#: Combo entry used for the tests' stand-in transition file -- deliberately
+#: neither "merged_transition" nor "cvrr"-sounding, to prove name-agnosticism.
+TRANSITION_ENTRY = "custom/adapter_v1.safetensors"
+
+
 def _write_transition(clip, spec, tmp_path):
     """Stand-in transition file (plus tiny release geometry) for the given clip."""
     import json
@@ -209,7 +221,7 @@ def _write_transition(clip, spec, tmp_path):
 
     model = getattr(clip.cond_stage_model, clip.cond_stage_model.clip)
     sd = random_transition(model, spec)
-    path = tmp_path / "cvrr" / "cvrr_merged_transition.safetensors"
+    path = tmp_path / "custom" / "adapter_v1.safetensors"
     path.parent.mkdir(parents=True, exist_ok=True)
     save_file(sd, str(path))
     # The apply node reads the release geometry from this file; the tiny
@@ -248,7 +260,7 @@ def test_apply_transition_retrofits_a_stock_clip(comfy, nodes_module, monkeypatc
     spec = tiny_spec_in_nodes
     clip = _stock_tiny_clip(comfy)
     path = _write_transition(clip, spec, tmp_path)
-    _serve_file(monkeypatch, nodes_module, "cvrr/cvrr_merged_transition.safetensors", path)
+    _serve_file(monkeypatch, nodes_module, TRANSITION_ENTRY, path)
 
     assert not nodes.is_cvrr_clip(clip), "stock loader output must not start CVRR-capable"
     image = torch.rand(1, 64, 64, 3)
@@ -257,7 +269,7 @@ def test_apply_transition_retrofits_a_stock_clip(comfy, nodes_module, monkeypatc
         baseline = clip.encode_from_tokens_scheduled(tokens)
 
     patched, info = nodes.CVRRApplyTransition().apply(
-        clip=clip, merged_transition="cvrr/cvrr_merged_transition.safetensors")
+        clip=clip, merged_transition=TRANSITION_ENTRY)
     assert patched is not clip, "LoRA-style nodes return a new CLIP handle"
     assert nodes.is_cvrr_clip(patched)
     attachment = getattr(patched, "cvrr_attachment", None)
@@ -300,7 +312,7 @@ def test_apply_transition_retrofits_a_stock_clip(comfy, nodes_module, monkeypatc
 
     # Re-attaching refreshes in place instead of wrapping twice.
     patched2, _ = nodes.CVRRApplyTransition().apply(
-        clip=patched, merged_transition="cvrr/cvrr_merged_transition.safetensors")
+        clip=patched, merged_transition=TRANSITION_ENTRY)
     assert nodes.is_cvrr_clip(patched2)
 
 
@@ -309,14 +321,14 @@ def test_apply_transition_requires_a_vision_tower(comfy, nodes_module, monkeypat
     spec = tiny_spec_in_nodes
     clip = _stock_tiny_clip(comfy)
     path = _write_transition(clip, spec, tmp_path)
-    _serve_file(monkeypatch, nodes_module, "cvrr/cvrr_merged_transition.safetensors", path)
+    _serve_file(monkeypatch, nodes_module, TRANSITION_ENTRY, path)
 
     model = getattr(clip.cond_stage_model, clip.cond_stage_model.clip)
     del model.transformer.visual  # simulate a text-only Qwen3 encoder (Klein's stock TE)
 
     with pytest.raises(ValueError, match="vision"):
         nodes_module.CVRRApplyTransition().apply(
-            clip=clip, merged_transition="cvrr/cvrr_merged_transition.safetensors")
+            clip=clip, merged_transition=TRANSITION_ENTRY)
 
 
 def test_apply_transition_rejects_shape_mismatched_weights(comfy, nodes_module,
@@ -331,11 +343,11 @@ def test_apply_transition_rejects_shape_mismatched_weights(comfy, nodes_module,
     first_key = sorted(sd)[0]
     sd[first_key] = sd[first_key].narrow(0, 0, max(1, sd[first_key].shape[0] - 1)).clone()
     save_file(sd, str(path))
-    _serve_file(monkeypatch, nodes_module, "cvrr/cvrr_merged_transition.safetensors", path)
+    _serve_file(monkeypatch, nodes_module, TRANSITION_ENTRY, path)
 
     with pytest.raises(ValueError, match="mismatch"):
         nodes_module.CVRRApplyTransition().apply(
-            clip=clip, merged_transition="cvrr/cvrr_merged_transition.safetensors")
+            clip=clip, merged_transition=TRANSITION_ENTRY)
 
 
 # ---------------------------------------------------------------------------
@@ -475,11 +487,11 @@ def test_apply_transition_on_a_bf16_clip(comfy, nodes_module, monkeypatch,
     clip = _stock_tiny_clip(comfy)
     clip.cond_stage_model.to(torch.bfloat16)
     path = _write_transition(clip, spec, tmp_path)
-    _serve_file(monkeypatch, nodes_module, "cvrr/cvrr_merged_transition.safetensors", path)
+    _serve_file(monkeypatch, nodes_module, TRANSITION_ENTRY, path)
 
     image = torch.rand(1, 64, 64, 3)
     patched, _ = nodes_module.CVRRApplyTransition().apply(
-        clip=clip, merged_transition="cvrr/cvrr_merged_transition.safetensors")
+        clip=clip, merged_transition=TRANSITION_ENTRY)
     _run_roundtrip(nodes_module, clip, patched, spec, image)
 
 
@@ -489,11 +501,11 @@ def test_apply_transition_on_an_fp8_e4m3_clip(comfy, nodes_module, monkeypatch,
     clip = _mixed_precision_tiny_clip(comfy, {"format": "float8_e4m3fn"})
     _quantize_clip_weights(clip, spec, "float8_e4m3fn")
     path = _write_transition(clip, spec, tmp_path)
-    _serve_file(monkeypatch, nodes_module, "cvrr/cvrr_merged_transition.safetensors", path)
+    _serve_file(monkeypatch, nodes_module, TRANSITION_ENTRY, path)
 
     image = torch.rand(1, 64, 64, 3)
     patched, _ = nodes_module.CVRRApplyTransition().apply(
-        clip=clip, merged_transition="cvrr/cvrr_merged_transition.safetensors")
+        clip=clip, merged_transition=TRANSITION_ENTRY)
     _run_roundtrip(nodes_module, clip, patched, spec, image)
 
 
@@ -503,11 +515,11 @@ def test_apply_transition_on_an_int8_convrot_clip(comfy, nodes_module, monkeypat
     clip = _mixed_precision_tiny_clip(comfy, {"format": "int8_tensorwise"})
     _quantize_clip_weights(clip, spec, "int8_tensorwise", convrot=True)
     path = _write_transition(clip, spec, tmp_path)
-    _serve_file(monkeypatch, nodes_module, "cvrr/cvrr_merged_transition.safetensors", path)
+    _serve_file(monkeypatch, nodes_module, TRANSITION_ENTRY, path)
 
     image = torch.rand(1, 64, 64, 3)
     patched, _ = nodes_module.CVRRApplyTransition().apply(
-        clip=clip, merged_transition="cvrr/cvrr_merged_transition.safetensors")
+        clip=clip, merged_transition=TRANSITION_ENTRY)
     _run_roundtrip(nodes_module, clip, patched, spec, image)
 
 
@@ -518,7 +530,7 @@ def test_apply_transition_rejects_an_unloaded_quantized_weight(comfy, nodes_modu
     clip = _mixed_precision_tiny_clip(comfy, {"format": "int8_tensorwise"})
     _quantize_clip_weights(clip, spec, "int8_tensorwise")
     path = _write_transition(clip, spec, tmp_path)
-    _serve_file(monkeypatch, nodes_module, "cvrr/cvrr_merged_transition.safetensors", path)
+    _serve_file(monkeypatch, nodes_module, TRANSITION_ENTRY, path)
 
     # Simulate a projection whose quantized weight has not finished streaming in.
     model = getattr(clip.cond_stage_model, clip.cond_stage_model.clip)
@@ -527,4 +539,4 @@ def test_apply_transition_rejects_an_unloaded_quantized_weight(comfy, nodes_modu
 
     with pytest.raises(ValueError, match="not finished loading"):
         nodes_module.CVRRApplyTransition().apply(
-            clip=clip, merged_transition="cvrr/cvrr_merged_transition.safetensors")
+            clip=clip, merged_transition=TRANSITION_ENTRY)

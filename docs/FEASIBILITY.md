@@ -149,7 +149,10 @@ How it works without ComfyUI's blessing:
 
 1. `clip.clone()` gives a fresh CLIP handle (ComfyUI's own API for
    "return a modified CLIP"; the patcher is isolated, the encoder module is
-   shared).
+   shared).  The transition file is selected from `models/text_encoders` with
+   the exact same combo as `CLIPLoader` — recursively, name-agnostically — and
+   is validated by *contents* (the seven projection tensors), never by its
+   filename or location.
 2. `ensure_cvrr_module()` validates the stack — must be a `Flux2TEModel` +
    Qwen3-VL decoder *with the vision tower* (`qwen3vl.Qwen3VL.visual`), with
    enough layers for the spec — then re-types the modules to the CVRR

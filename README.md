@@ -82,8 +82,14 @@ CVRR exists.
 
 ## Use (FLUX.2 Klein 9B edit)
 
+Two ready workflows in `examples/`: `CVRR_demo_workflow.json` (the
+LoRA-style attach recommended below) and `klein9b_cvrr_edit.json` (the
+dedicated loader used here).
+
 1. **CVRR Qwen3-VL Text Encoder Loader** → `cvrr/cvrr_qwen3vl_8b-00001.safetensors`,
-   `mode = aligned`, `cvrr/cvrr_merged_transition.safetensors`.
+   `mode = aligned`, transition from the same combo (`merged_transition` may be
+   any file in `models/text_encoders`, any name; leave empty to auto-pick the
+   canonical sibling from a converted release).
 2. Load `flux-2-klein-9b-fp8.safetensors` + `flux2-vae.safetensors` as usual.
 3. **CVRR Edit Text Encode (Klein ref-latent)**: prompt, your image, the VAE, `vl_megapixels ≈ 0.25`
    (what CVRR sees), `reference_megapixels ≈ 1.0` (what the VAE encodes).
@@ -96,13 +102,18 @@ More reference images: feed the conditioning through extra
 ### Alternative: LoRA-style attach to any Qwen3-VL-8B encoder
 
 The converted full checkpoint from step 1 is optional. The only CVRR-specific
-weight file is `merged_transition.safetensors` (772 MB), so you can attach it
-to any Qwen3-VL-8B text encoder you already have — including finetunes that
+weight file is the 772 MB merged transition, so you can attach it to any
+Qwen3-VL-8B text encoder you already have — including finetunes that
 kept the architecture:
 
 1. **CLIPLoader** (`type = flux2`) → your `qwen3vl-8b*-finetuned.safetensors`.
-2. **CVRR Apply Merged Transition** → `cvrr/cvrr_merged_transition.safetensors`
-   (drop it into `models/text_encoders/`). This returns a new CLIP handle.
+2. **CVRR Apply Merged Transition** → pick the adapter from the combo; it lists
+   everything in `models/text_encoders` exactly like `CLIPLoader`, recursively
+   and **name-agnostically** (rename it `adapter_v1.safetensors`, nest it in
+   subfolders — validity is checked by contents: the seven fp32 projection
+   tensors, not the file name).
+   [`examples/CVRR_demo_workflow.json`](examples/CVRR_demo_workflow.json)
+   shows this exact wiring. This returns a new CLIP handle.
 3. Continue at step 3 of the recipe above with that handle.
 
 The node validates before attaching (must be a Qwen3-**VL** stack with a

@@ -53,35 +53,27 @@ MODE_OPTIONS = ["aligned", "strict", "vl"]
 
 
 def _encoder_files() -> List[str]:
+    """Everything in ``models/text_encoders`` (recursively, subfolder-prefixed).
+
+    Identical to the list the stock ``CLIPLoader`` combo shows, so the merged
+    transition can live next to the encoder checkpoints under *any* file name,
+    exactly like every other text-encoder-side asset ComfyUI loads.
+    """
     try:
         return folder_paths.get_filename_list("text_encoders")
     except Exception:  # pragma: no cover - folder not registered
         return []
 
 
-def _transition_files() -> List[str]:
-    """Merged-transition files: ``merged_transition.safetensors`` in any model
-    folder, or anything matching ``*transition*.safetensors`` next to a text
-    encoder."""
-    found: List[str] = []
-    for folder in ("text_encoders", "clip", "diffusion_models", "unet"):
-        try:
-            names = folder_paths.get_filename_list(folder)
-        except Exception:  # pragma: no cover
-            continue
-        for name in names:
-            base = os.path.basename(name).lower()
-            if "transition" in base or "cvrr" in base:
-                if name not in found:
-                    found.append(name)
-    return found
-
-
-def _resolve(folder: str, name: str) -> str:
-    path = folder_paths.get_full_path(folder, name)
-    if path is None:  # pragma: no cover - defensive
-        raise ValueError(f"comfyui_cvrr: could not resolve {folder}/{name}")
-    return path
+def _resolve_transition(name: str) -> str:
+    """Resolve a combo selection the way ``CLIPLoader`` resolves ``clip_name``:
+    inside ``models/text_encoders`` first, with a back-compat fallback to the
+    other model folders for older layouts."""
+    for folder in ("text_encoders", "diffusion_models", "unet", "clip"):
+        path = folder_paths.get_full_path(folder, name)
+        if path:
+            return path
+    raise ValueError(f"comfyui_cvrr: cannot find {name!r} in models/text_encoders")
 
 
 def _spec_from_encoder_file(encoder_path: str, taps: Sequence[int]) -> CVRRSpec:
@@ -153,7 +145,7 @@ class CVRRTextEncoderLoader:
     @classmethod
     def INPUT_TYPES(cls):
         encoders = _encoder_files()
-        transitions = [""] + _transition_files()
+        transitions = [""] + encoders  # name-agnostic, same list as CLIPLoader
         return {
             "required": {
                 "clip_name": (encoders,),
@@ -181,7 +173,7 @@ class CVRRTextEncoderLoader:
 
     def load(self, clip_name, mode="aligned", merged_transition="", device="default",
              blocksize=0, inference_steps=0, beta=-1.0, tap_gains=""):
-        encoder_path = _resolve("text_encoders", clip_name)
+        encoder_path = _resolve_transition(clip_name)
         spec = _spec_from_encoder_file(encoder_path, RELEASE_SPEC.taps)
         if blocksize:
             spec = CVRRSpec(ell_star=int(blocksize), num_recurrent_steps=spec.num_recurrent_steps,
@@ -195,15 +187,10 @@ class CVRRTextEncoderLoader:
 
         transition_path = None
         if merged_transition:
-            folder = "text_encoders"
-            transition_path = folder_paths.get_full_path(folder, merged_transition)
-            if transition_path is None:
-                for candidate in ("diffusion_models", "unet", "clip"):
-                    transition_path = folder_paths.get_full_path(candidate, merged_transition)
-                    if transition_path is not None:
-                        break
-        if transition_path is None:
-            # look for a sibling file with the canonical release name
+            transition_path = _resolve_transition(merged_transition)
+        else:
+            # convenience only: a converted release bundles the canonical file
+            # next to the encoder; picking the file in the combo always wins
             sibling = os.path.join(os.path.dirname(encoder_path), TRANSITION_FILE_NAME)
             transition_path = sibling if os.path.isfile(sibling) else None
 
@@ -240,32 +227,31 @@ def _spec_with_overrides(directory: str, blocksize: int, inference_steps: int,
     return spec
 
 
-def _resolve_transition(name: str) -> str:
-    for folder in ("text_encoders", "diffusion_models", "unet", "clip"):
-        path = folder_paths.get_full_path(folder, name)
-        if path:
-            return path
-    raise ValueError(f"comfyui_cvrr: cannot find {name}")
-
-
 class CVRRApplyTransition:
-    """Attach ``merged_transition.safetensors`` to any Qwen3-VL CLIP, LoRA-style.
+    """Attach a CVRR merged transition to any Qwen3-VL CLIP, LoRA-style.
 
     The merged transition is the only CVRR-specific weight artifact, so instead
     of loading a dedicated converted file this node patches an already-loaded
     CLIP: stock ``CLIPLoader`` output (type ``flux2``), a converted CVRR file,
     or any Qwen3-VL-8B finetune that kept the architecture's shapes.  The
-    underlying encoder object is shared between cloned CLIP handles, but the
-    transition weights stay disabled for regular (non-CVRR) encodes -- they are
-    gated per encode by the CVRR encode nodes, not permanently merged.
+    transition file is selected from ``models/text_encoders`` exactly like a
+    ``CLIPLoader``-style combo -- any name, any subfolder -- and is validated
+    by contents (7 projection tensors), not by its filename.  The underlying
+    encoder object is shared between cloned CLIP handles, but the transition
+    weights stay disabled for regular (non-CVRR) encodes -- they are gated
+    per encode by the CVRR encode nodes, not permanently merged.
     """
 
     @classmethod
     def INPUT_TYPES(cls):
+        files = _encoder_files()
         return {
             "required": {
                 "clip": ("CLIP",),
-                "merged_transition": ([""] + _transition_files(),),
+                "merged_transition": (files, {"tooltip":
+                    "The CVRR merged transition safetensors (7 fp32 projection "
+                    "tensors of the recurrent layer). Any file name works; it is "
+                    "validated by contents, not by name."}),
             },
             "optional": {
                 "blocksize": ("INT", {"default": 0, "min": 0, "max": 512, "advanced": True,
@@ -296,7 +282,10 @@ class CVRRApplyTransition:
         else:  # pragma: no cover - non-standard CLIP handle
             log.warning("comfyui_cvrr: input CLIP has no clone(); patching in place")
             patched = clip
-        apply_transition(patched, state_dict, spec=spec)
+        try:
+            apply_transition(patched, state_dict, spec=spec)
+        except ValueError as exc:
+            raise ValueError(f"comfyui_cvrr: attaching {merged_transition!r} failed: {exc}") from exc
         patched.cvrr_attachment = spec
         info = (
             f"CVRR {spec.name}: ell_star={spec.ell_star} recurrent_layer={spec.recurrent_layer} "
