@@ -384,15 +384,22 @@ class CVRRTE(comfy.text_encoders.flux.Flux2TEModel):
 
     def encode_token_weights(self, token_weight_pairs):
         self.text_model.last_cvrr_result = None
-        pairs = token_weight_pairs[self.clip_name]
-        for token in pairs:
-            for entry in token:
-                if len(entry) > 1 and entry[1] != 1.0:
-                    raise ValueError(
-                        "comfyui_cvrr: per-token prompt weights are not supported by the "
-                        "CVRR encoder because the emitted token count differs from the "
-                        "tokenised prompt (image tokens are removed)."
-                    )
+        # Only enforce the no-per-token-weights rule while a CVRR encode is
+        # configured.  Encoder stacks retrofitted via ``apply_transition`` are
+        # re-typed to this class but shared with non-CVRR consumers (e.g. a
+        # stock CLIP Text Encode using weighted prompts), and those must keep
+        # working when no CVRR encode is in flight.
+        options = getattr(self.text_model, "cvrr_options", None)
+        if options is not None and options.enabled:
+            pairs = token_weight_pairs[self.clip_name]
+            for token in pairs:
+                for entry in token:
+                    if len(entry) > 1 and entry[1] != 1.0:
+                        raise ValueError(
+                            "comfyui_cvrr: per-token prompt weights are not supported by the "
+                            "CVRR encoder because the emitted token count differs from the "
+                            "tokenised prompt (image tokens are removed)."
+                        )
         out, pooled, extra = super().encode_token_weights(token_weight_pairs)
 
         result = self.text_model.last_cvrr_result
@@ -468,21 +475,92 @@ def _make_te_factory(spec: CVRRSpec, model_type: str):
     return CVRRTE_
 
 
-def apply_transition(clip, transition_state_dict, spec: Optional[CVRRSpec] = None) -> None:
-    """Install merged transition weights on a CLIP produced by any loader."""
-    te = clip.cond_stage_model
-    model = te.clip_model if isinstance(te, CVRRTE) else None
-    if model is None:
+def _cvrr_state_defaults(text_model) -> None:
+    """Instance attributes ``CVRRTextModel.__init__`` would have set."""
+    if not hasattr(text_model, "cvrr_options"):
+        text_model.cvrr_options: Optional[CVRROptions] = None
+        text_model.cvrr_core: Optional[CVRRTextEncoderCore] = None
+        text_model.cvrr_transition: Optional[MergedTransition] = None
+        text_model.last_cvrr_result: Optional[CVRREncodeResult] = None
+
+
+def ensure_cvrr_module(clip, spec: Optional[CVRRSpec] = None):
+    """Upgrade a *stock* Qwen3-VL text encoder CLIP to the CVRR classes in place.
+
+    This is the counterpart of :func:`build_clip`: instead of loading a
+    dedicated file, an existing ``Flux2TEModel`` + ``Qwen3VLClipModel`` +
+    ``Qwen3VL`` stack (stock ``CLIPLoader`` output, or any finetune that kept
+    the architecture) is re-typed to the CVRR subclasses.  All attributes the
+    subclasses rely on are plain ``__dict__`` entries, so a ``__class__`` swap
+    plus defaults is sufficient.
+
+    Returns the cond-stage text encoder object.  Raises a descriptive
+    ``ValueError`` for encoders that cannot host CVRR (non-Qwen3-VL
+    architectures, or the *text-only* Qwen3 encoders such as Klein's stock
+    ``qwen_3_8b``: CVRR needs the vision tower).
+    """
+    spec = spec or RELEASE_SPEC
+    te = getattr(clip, "cond_stage_model", None)
+    if te is None:
+        raise ValueError("comfyui_cvrr: object has no cond_stage_model; expected a ComfyUI CLIP")
+    if isinstance(te, CVRRTE):  # built by build_clip(); already CVRR-capable
+        return te
+    model = getattr(te, getattr(te, "clip", ""), None)
+    if model is None or not hasattr(model, "transformer"):
         raise ValueError(
-            "comfyui_cvrr: this CLIP was not loaded as a CVRR text encoder; load the "
-            "converted CVRR file with the 'CVRR Qwen3-VL Text Encoder Loader' node, or "
-            "convert it and use CLIPLoader with type 'flux2' plus this node (the latter "
-            "gives the stock encoder without recurrence)."
+            "comfyui_cvrr: unsupported text encoder stack "
+            f"({type(te).__name__}); CVRR needs a Qwen3-VL (Flux2/Klein-style) "
+            "text encoder CLIP"
         )
+    text_model = model.transformer
+    if not hasattr(text_model, "model") or not hasattr(text_model, "num_layers"):
+        raise ValueError(
+            "comfyui_cvrr: unsupported text encoder "
+            f"({type(text_model).__name__}); CVRR needs the Qwen3-VL decoder stack"
+        )
+    if not hasattr(text_model, "visual"):
+        raise ValueError(
+            "comfyui_cvrr: CVRR needs the Qwen3-*VL* architecture with a vision "
+            "tower; this CLIP is a text-only Qwen3 encoder (e.g. Klein's stock "
+            "qwen_3_8b). Load a Qwen3-VL-8B-based file (the converted CVRR "
+            "release, or any Qwen3-VL-8B finetune) with CLIPLoader type 'flux2' "
+            "and attach the transition again."
+        )
+    spec.validate(text_model.num_layers)
+    text_model.__class__ = CVRRTextModel
+    _cvrr_state_defaults(text_model)
+    model.__class__ = CVRRQwen3VLClipModel
+    te.__class__ = CVRRTE
+    if isinstance(getattr(model, "layer", None), (list, tuple)):
+        # keep the stock fallback path's intermediate taps aligned with the spec
+        model.layer = list(spec.taps)
+    return te
+
+
+def apply_transition(clip, transition_state_dict, spec: Optional[CVRRSpec] = None):
+    """Install merged transition weights on any Qwen3-VL CLIP, LoRA-style.
+
+    The 772 MB ``merged_transition.safetensors`` is the *only* CVRR-specific
+    weight artifact, so it can be attached to any Qwen3-VL-8B-family encoder
+    (the converted CVRR release, or a finetune with the same shapes) instead of
+    shipping a merged checkpoint per finetune.  The weights live as fp32
+    non-persistent buffers wrapped around the recurrent layer's seven
+    projections (:class:`~comfyui_cvrr.cvrr_core.MergedProjection`) and stay
+    disabled unless an encode is explicitly configured, so attaching them does
+    not change stock (non-CVRR) encodes of the same encoder.
+
+    Note: the underlying encoder object is shared between CLIP handles cloned
+    from the same loader output, so attaching a *different* transition file
+    replaces the previous one for all handles (same caveat as LoRA-relevant
+    mutations of a cached model; attaching the same file twice is a refresh).
+    """
+    te = ensure_cvrr_module(clip, spec)
+    model = te.clip_model
     model.attach_transition(transition_state_dict, spec=spec)
     if model.text_model.cvrr_options is not None:
         model.text_model.configure_cvrr(spec=spec or model.text_model.cvrr_options.spec,
                                         mode=model.text_model.cvrr_options.mode)
+    return te
 
 
 def is_cvrr_clip(clip) -> bool:

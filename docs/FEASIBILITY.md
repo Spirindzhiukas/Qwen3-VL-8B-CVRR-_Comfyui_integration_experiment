@@ -131,6 +131,57 @@ subclassed, and stock behaviour is the default (`CVRRTextModel.forward`
 delegates to `Qwen3VL.forward` unless CVRR is configured *and* an image is
 present). If the pack is removed, everything reverts to stock.
 
+## 5a. Option C — LoRA-style attach to any Qwen3-VL-8B encoder (implemented)
+
+The conversion in §5 turns out to be optional, because the decomposition of
+the release pushes that far: the only CVRR-specific *weights* are the seven
+FP32 projection tensors of `merged_transition.safetensors`. So instead of a
+converted checkpoint per encoder, the **CVRR Apply Transition** node can take
+any already-loaded Qwen3-VL CLIP — stock `CLIPLoader` output, or a community
+Qwen3-VL-8B finetune — and upgrade it in place:
+
+```
+CLIPLoader (type = flux2, any Qwen3-VL-8B file)
+        └─► CVRR Apply Transition (merged_transition.safetensors) → CLIP ─► CVRR encode nodes
+```
+
+How it works without ComfyUI's blessing:
+
+1. `clip.clone()` gives a fresh CLIP handle (ComfyUI's own API for
+   "return a modified CLIP"; the patcher is isolated, the encoder module is
+   shared).
+2. `ensure_cvrr_module()` validates the stack — must be a `Flux2TEModel` +
+   Qwen3-VL decoder *with the vision tower* (`qwen3vl.Qwen3VL.visual`), with
+   enough layers for the spec — then re-types the modules to the CVRR
+   subclasses (`__class__` swap; the subclasses add only plain attributes).
+3. `install_merged_transition()` wraps the recurrent layer's seven projections
+   in `MergedProjection`s holding the FP32 merged weight as a **non-persistent
+   buffer** — so `state_dict()` is untouched and ComfyUI's weight machinery
+   (ModelPatcher, offloading, extra reloads) does not see it.
+
+Why **not** ComfyUI's actual LoRA/weight-patch machinery? A patcher diff would
+apply the merge *permanently while loaded* — but CVRR's adapter-off pass
+(`text_anchor`) must run on the *native* weights while the recurrent passes
+run on the merged ones. That per-pass gating is exactly what
+`MergedProjection.enabled` does, so the weight patch and the gating must live
+at module level. Load-time patching stays the fallback story; runtime gating
+is the algorithm.
+
+Caveats (documented in the README):
+
+- The encoder object is shared between CLIP handles, so attaching a
+  *different* transition file replaces the previous one for all handles of
+  that loader output; attaching the same file twice is a no-op refresh.
+  Non-CVRR encodes are unaffected either way (gating, not weights, decides).
+- Text-only Qwen3 encoders — Klein's stock `qwen_3_8b` TE — cannot host CVRR
+  at all (no vision tower, and the encoder config itself is Qwen3 not
+  Qwen3-VL); the node raises with guidance instead of failing later.
+- Same-shape finetunes work mechanically; the release transition was trained
+  against the instruct backbone's activations, so quality is a finetune-
+  distance-dependent unknown (same open question as §6, amplified).
+- The 772 MB stays one file for *every* finetune — no re-merging, no extra
+  converted checkpoints.
+
 ### Reference-encode nodes (mapping to the examples that were named)
 
 | Named example | What we built | Difference |
@@ -190,8 +241,8 @@ an empirical question that needs a GPU and the real weights.
 
 ## 7. What has actually been verified
 
-`35 tests, all green on CPU` (`cd comfyui_cvrr && pytest`) — see
-`tests/`:
+`38 tests, all green on CPU` (`pytest`, with a ComfyUI checkout at
+`COMFYUI_PATH`) — see `tests/`:
 
 * `test_cvrr_core.py` — algorithm: mode-vs-reference equality, FP32 transition
   and idempotency, token layouts, image-awareness invariants
@@ -208,7 +259,12 @@ an empirical question that needs a GPU and the real weights.
 * `test_converter.py` — a synthetic HF-layout release converts, verifies against
   ComfyUI's parameter names, and re-loads; `--transition-only` produces the
   7-tensor FP32 file.
-* `test_nodes.py` — node schemas, mappings and helpers.
+* `test_nodes.py` — node schemas, mappings, the example workflow's widgets,
+  and the §5a attach path: a *stock* `CLIPLoader`-style `Flux2TEModel` CLIP
+  gets retrofitted, keeps producing bit-identical stock encodes for
+  non-CVRR use, and encodes CVRR conditioning (deterministically, with the
+  stock state restored afterwards); vision-tower-less encoders and
+  shape-mismatched transitions are rejected with clear errors.
 
 Not verified (no GPU, no weights in this sandbox): real 8B inference, output
 quality, speed, VRAM. The 17.5 GB backbone and the 772 MB transition were never
@@ -233,7 +289,7 @@ downloaded.
 
 ```
 comfyui_cvrr/          the custom node pack (see §5)
-tests/                 35 CPU tests (tiny stand-in config, real ComfyUI modules)
+tests/                 38 CPU tests (tiny stand-in config, real ComfyUI modules)
 examples/              klein9b_cvrr_edit.json — ready-to-load ComfyUI workflow
 docs/FEASIBILITY.md    this document
 ```

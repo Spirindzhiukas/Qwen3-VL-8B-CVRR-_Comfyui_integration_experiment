@@ -4,8 +4,9 @@ Node set
 --------
 ``CVRRTextEncoderLoader``   load a converted CVRR text encoder (+ optional merged
                             transition) with ComfyUI's own ``CLIP`` object
-``CVRRApplyTransition``     attach ``merged_transition.safetensors`` to an already
-                            loaded CVRR encoder
+``CVRRApplyTransition``     LoRA-style attach of ``merged_transition.safetensors``
+                            to *any* loaded Qwen3-VL CLIP (stock CLIPLoader output
+                            or a finetune) -- no dedicated converted file needed
 ``CVRRTextEncode``          CLIP Text Encode with an optional reference image: the
                             conditioning is produced by CVRR's visual recurrence
 ``CVRREditTextEncode``      convenience node in the spirit of community
@@ -17,6 +18,7 @@ Node set
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -25,6 +27,8 @@ import torch
 
 import folder_paths
 import node_helpers
+
+log = logging.getLogger("comfyui_cvrr")
 
 from .cvrr_te import (
     RELEASE_CONFIG_NAME,
@@ -91,10 +95,12 @@ def _encode_with_options(clip, tokens, options: CVRROptions, enabled: bool = Tru
     model = clip.cond_stage_model
     if not is_cvrr_clip(clip):
         raise ValueError(
-            "comfyui_cvrr: this CLIP was not loaded as a CVRR text encoder. Use the "
-            "'CVRR Qwen3-VL Text Encoder Loader' node (recommended) or convert the "
-            "checkpoint and load it with CLIPLoader type 'flux2' -- the latter runs "
-            "the stock Qwen3-VL language model *without* the CVRR recurrence."
+            "comfyui_cvrr: this CLIP is not CVRR-enabled. Either use the 'CVRR "
+            "Qwen3-VL Text Encoder Loader' node with a converted CVRR file, or "
+            "load any Qwen3-VL-8B CLIP (CLIPLoader type 'flux2') and run it "
+            "through the 'CVRR Apply Transition' node with "
+            "merged_transition.safetensors -- the latter is the LoRA-style attach "
+            "path and works with Qwen3-VL-8B finetunes too."
         )
     previous = getattr(getattr(model, "text_model", None), "cvrr_options", None)
     spec = previous.spec if previous is not None else options.spec
@@ -218,8 +224,41 @@ class CVRRTextEncoderLoader:
         return (clip, info)
 
 
+def _spec_with_overrides(directory: str, blocksize: int, inference_steps: int,
+                         beta: float) -> CVRRSpec:
+    """Release-rack spec from ``directory`` plus the optional advanced overrides."""
+    spec = load_release_spec(directory, taps=RELEASE_SPEC.taps)
+    if blocksize:
+        spec = CVRRSpec(ell_star=int(blocksize), num_recurrent_steps=spec.num_recurrent_steps,
+                        beta=spec.beta, taps=spec.taps, name=spec.name)
+    if inference_steps:
+        spec = CVRRSpec(ell_star=spec.ell_star, num_recurrent_steps=int(inference_steps),
+                        beta=spec.beta, taps=spec.taps, name=spec.name)
+    if beta >= 0:
+        spec = CVRRSpec(ell_star=spec.ell_star, num_recurrent_steps=spec.num_recurrent_steps,
+                        beta=float(beta), taps=spec.taps, name=spec.name)
+    return spec
+
+
+def _resolve_transition(name: str) -> str:
+    for folder in ("text_encoders", "diffusion_models", "unet", "clip"):
+        path = folder_paths.get_full_path(folder, name)
+        if path:
+            return path
+    raise ValueError(f"comfyui_cvrr: cannot find {name}")
+
+
 class CVRRApplyTransition:
-    """Install ``merged_transition.safetensors`` on a loaded CVRR text encoder."""
+    """Attach ``merged_transition.safetensors`` to any Qwen3-VL CLIP, LoRA-style.
+
+    The merged transition is the only CVRR-specific weight artifact, so instead
+    of loading a dedicated converted file this node patches an already-loaded
+    CLIP: stock ``CLIPLoader`` output (type ``flux2``), a converted CVRR file,
+    or any Qwen3-VL-8B finetune that kept the architecture's shapes.  The
+    underlying encoder object is shared between cloned CLIP handles, but the
+    transition weights stay disabled for regular (non-CVRR) encodes -- they are
+    gated per encode by the CVRR encode nodes, not permanently merged.
+    """
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -228,25 +267,44 @@ class CVRRApplyTransition:
                 "clip": ("CLIP",),
                 "merged_transition": ([""] + _transition_files(),),
             },
+            "optional": {
+                "blocksize": ("INT", {"default": 0, "min": 0, "max": 512, "advanced": True,
+                                      "tooltip": "0 = use the release value (ell_star)."}),
+                "inference_steps": ("INT", {"default": 0, "min": 0, "max": 32, "advanced": True,
+                                            "tooltip": "0 = use the release value (T)."}),
+                "beta": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 1.0, "step": 0.01,
+                                   "advanced": True,
+                                   "tooltip": "-1 = use the release value (0.33)."}),
+            },
         }
 
-    RETURN_TYPES = ("CLIP",)
+    RETURN_TYPES = ("CLIP", "STRING")
+    RETURN_NAMES = ("clip", "info")
     FUNCTION = "apply"
     CATEGORY = "model/conditioning/cvrr"
 
-    def apply(self, clip, merged_transition):
-        path = None
-        for folder in ("text_encoders", "diffusion_models", "unet", "clip"):
-            path = folder_paths.get_full_path(folder, merged_transition)
-            if path:
-                break
-        if path is None:
-            raise ValueError(f"comfyui_cvrr: cannot find {merged_transition}")
+    def apply(self, clip, merged_transition, blocksize=0, inference_steps=0, beta=-1.0):
+        if not merged_transition:
+            raise ValueError("comfyui_cvrr: select a merged transition file")
+        path = _resolve_transition(merged_transition)
+        spec = _spec_with_overrides(os.path.dirname(path), blocksize, inference_steps, beta)
         import comfy.utils
 
-        state_dict, _ = comfy.utils.load_torch_file(path, safe_load=True, return_metadata=True)
-        apply_transition(clip, state_dict)
-        return (clip,)
+        state_dict = comfy.utils.load_torch_file(path, safe_load=True)
+        if hasattr(clip, "clone"):
+            patched = clip.clone()
+        else:  # pragma: no cover - non-standard CLIP handle
+            log.warning("comfyui_cvrr: input CLIP has no clone(); patching in place")
+            patched = clip
+        apply_transition(patched, state_dict, spec=spec)
+        patched.cvrr_attachment = spec
+        info = (
+            f"CVRR {spec.name}: ell_star={spec.ell_star} recurrent_layer={spec.recurrent_layer} "
+            f"upper_decoder={spec.upper_decoder_start} T={spec.num_recurrent_steps} "
+            f"beta={spec.beta} transition={os.path.basename(path)}"
+        )
+        log.info("comfyui_cvrr: attached %s -> %s", info, os.path.basename(path))
+        return (patched, info)
 
 
 # ---------------------------------------------------------------------------
@@ -441,6 +499,9 @@ class CVRRSetReferenceLatent:
 
 
 def _cvrr_spec_of(clip) -> CVRRSpec:
+    attachment = getattr(clip, "cvrr_attachment", None)
+    if isinstance(attachment, CVRRSpec):
+        return attachment
     model = getattr(clip, "cond_stage_model", None)
     options = getattr(getattr(model, "text_model", None), "cvrr_options", None)
     if options is not None:

@@ -9,7 +9,7 @@ stay in context.
 
 * **Feasibility write-up:** [`docs/FEASIBILITY.md`](docs/FEASIBILITY.md)
 * **Example graph:** [`examples/klein9b_cvrr_edit.json`](examples/klein9b_cvrr_edit.json)
-* **Tests:** 35 CPU tests (`pytest` in this directory), run against the real
+* **Tests:** 38 CPU tests (`pytest` in this directory), run against the real
   ComfyUI modules — no ComfyUI patching, nothing is monkey-patched at import.
 
 ## Why this exists
@@ -70,7 +70,7 @@ Add `--dry-run` to inspect the mapping without writing anything.
 | Node | Purpose |
 |---|---|
 | **CVRR Qwen3-VL Text Encoder Loader** | Loads the converted encoder + `cvrr_merged_transition.safetensors`; `mode` = `aligned` (default) / `strict` / `vl`; optional `blocksize`, `inference_steps`, `beta`, `tap_gains` overrides; reports the resolved CVRR geometry. |
-| **CVRR Apply Merged Transition** | Adds/refreshes the recurrent transition on any CLIP produced by another loader. |
+| **CVRR Apply Merged Transition** | **LoRA-style attach:** patches `merged_transition.safetensors` onto *any* already-loaded Qwen3-VL CLIP (stock `CLIPLoader` output with type `flux2`, or a Qwen3-VL-8B finetune — no converted file per finetune needed). Returns a new CLIP handle; the merged weights sit as gated fp32 buffers on the recurrent layer, so non-CVRR encodes of the same encoder are untouched. |
 | **CVRR Text Encode (Qwen3-VL / Klein)** | `CLIP Text Encode (Prompt)` for CVRR: prompt + optional image → `CONDITIONING` (+ info). |
 | **CVRR Edit Text Encode (Klein ref-latent)** | The Klein edit node: prompt + image + VAE → positive/negative `CONDITIONING`, **with the reference latent already appended** (equivalent to `CLIP Text Encode` → `VAEEncode` → `Set Reference Latent`). Optional second image, `reference_latents_method`, per-tap gains. |
 | **CVRR Set Reference Latent+** | Chainable `Reference Latent+`: appends one more reference latent to a conditioning and returns it. |
@@ -93,10 +93,38 @@ CVRR exists.
 More reference images: feed the conditioning through extra
 **CVRR Set Reference Latent+** nodes, or use the node's second image input.
 
+### Alternative: LoRA-style attach to any Qwen3-VL-8B encoder
+
+The converted full checkpoint from step 1 is optional. The only CVRR-specific
+weight file is `merged_transition.safetensors` (772 MB), so you can attach it
+to any Qwen3-VL-8B text encoder you already have — including finetunes that
+kept the architecture:
+
+1. **CLIPLoader** (`type = flux2`) → your `qwen3vl-8b*-finetuned.safetensors`.
+2. **CVRR Apply Merged Transition** → `cvrr/cvrr_merged_transition.safetensors`
+   (drop it into `models/text_encoders/`). This returns a new CLIP handle.
+3. Continue at step 3 of the recipe above with that handle.
+
+The node validates before attaching (must be a Qwen3-**VL** stack with a
+vision tower — Klein's stock `qwen_3_8b` text-only TE is rejected with a clear
+error — and the seven projection shapes must match). Attaching is inert for
+regular encodes: the transition weights are runtime-gated buffers, so a CLIP
+handle that never goes through the CVRR encode nodes behaves exactly like the
+stock encoder. Two notes:
+
+- The underlying encoder object is shared between CLIP handles cloned from
+  the same loader output, so attaching a *different* transition file replaces
+  the previous one for all of them (same caveat as any LoRA-relevant mutation
+  of a cached model; attaching the same file twice is just a refresh).
+- The released transition was trained against the instruct Qwen3-VL-8B
+  backbone; on a diverged finetune the mechanics hold, but the visual
+  recurrence targets different activations — expect the quality question mark
+  to grow with the distance of the finetune.
+
 ## Tests
 
 ```bash
-COMFYUI_PATH=~/ComfyUI pytest     # 35 tests, CPU only, ~2 GB RAM
+COMFYUI_PATH=~/ComfyUI pytest     # 38 tests, CPU only, ~2 GB RAM
 ```
 
 `COMFYUI_PATH` defaults to `../ComfyUI_src`; without a checkout the
