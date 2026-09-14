@@ -1,0 +1,19 @@
+{
+  "name": "CVRR-Qwen3-VL-8B",
+  "base_model": "Qwen/Qwen3-VL-8B-Instruct",
+  "ell_star": 22,
+  "recurrent_layer": 23,
+  "upper_decoder_start": 24,
+  "inference_T": 4,
+  "inference_beta": 0.33,
+  "lora_rank": 32,
+  "lora_alpha": 12.0,
+  "lora_dropout": 0.01,
+  "checkpoint_step": 500,
+  "format": "cvrr_native_plus_merged_transition_v1",
+  "merged_weight_dtype": "float32",
+  "native_weight_bytes": 17534247392,
+  "status": "gpu_vstar_comparison_completed",
+  "upload_ready": true,
+  "hub_model_id": "dmis-lab/Qwen3-VL-8B-CVRR"
+}
