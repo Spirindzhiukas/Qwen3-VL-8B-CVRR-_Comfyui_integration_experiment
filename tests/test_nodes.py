@@ -540,3 +540,35 @@ def test_apply_transition_rejects_an_unloaded_quantized_weight(comfy, nodes_modu
     with pytest.raises(ValueError, match="not finished loading"):
         nodes_module.CVRRApplyTransition().apply(
             clip=clip, merged_transition=TRANSITION_ENTRY)
+
+
+def test_cvrr_encode_refuses_a_visionless_encoder(comfy, nodes_module, monkeypatch,
+                                                  tmp_path, tiny_spec_in_nodes):
+    """A text-only / --drop-vision export has no visual.* weights: ComfyUI leaves
+    those modules on meta tensors forever, and the first image encode used to die
+    inside the vision forward with 'Cannot copy out of meta tensor'.  The guard
+    must turn that into an actionable error -- without touching text-only encodes.
+    """
+    spec = tiny_spec_in_nodes
+    clip = _stock_tiny_clip(comfy)
+    path = _write_transition(clip, spec, tmp_path)
+    _serve_file(monkeypatch, nodes_module, TRANSITION_ENTRY, path)
+    patched, _ = nodes_module.CVRRApplyTransition().apply(
+        clip=clip, merged_transition=TRANSITION_ENTRY)
+
+    model = getattr(patched.cond_stage_model, patched.cond_stage_model.clip)
+    # exactly how ComfyUI leaves never-loaded weights behind (meta device):
+    for mod in model.transformer.visual.modules():
+        for name, param in list(mod._parameters.items()):
+            if param is not None:
+                mod._parameters[name] = torch.nn.Parameter(
+                    torch.empty(tuple(param.shape), device="meta", dtype=param.dtype),
+                    requires_grad=False)
+
+    with pytest.raises(RuntimeError, match="vision tower"):
+        nodes_module.CVRRTextEncode().encode(clip=patched, prompt="whatever", mode="aligned",
+                                             vl_megapixels=0.0, image=torch.rand(1, 64, 64, 3))
+
+    cond, _ = nodes_module.CVRRTextEncode().encode(clip=patched, prompt="text only, no image",
+                                                   mode="aligned", vl_megapixels=0.0)
+    assert cond[0][0].shape[0] == 1 and cond[0][0].numel() > 0  # ran, layout covered elsewhere

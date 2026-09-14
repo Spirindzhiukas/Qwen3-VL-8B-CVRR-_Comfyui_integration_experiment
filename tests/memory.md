@@ -17,14 +17,17 @@
   text-only fallback. `_same` treats NaN==NaN; each forward gets its own
   `embeds.clone()`.
 - `test_converter.py` (4) — synthetic release → convert → verify → reload.
-- `test_loader.py` (3) — converted file loads via real `ClipTarget` +
-  `comfy.sd.CLIP`; `apply_transition` flips to recurrent path.
-- `test_nodes.py` (13) — needs stub `folder_paths`/`node_helpers` (fixture
+- `test_loader.py` (4) — converted file loads via real `ClipTarget` +
+  `comfy.sd.CLIP`; `apply_transition` flips to recurrent path; vision-less
+  (text-only export) files are flagged at build (`cvrr_no_vision` + warning).
+- `test_nodes.py` (14) — needs stub `folder_paths`/`node_helpers` (fixture
   `nodes_module`). Covers schemas/mappings, example-workflow widget validation
   (iterates **all** `examples/*.json`), the retrofit attach on a stock CLIP
   (encode parity, determinism, state restore, weighted-prompt escape hatch,
   refresh idempotence), rejection paths (no vision tower, shape mismatch,
-  unloaded quantized weight), and quantized bases (bf16, fp8-e4m3, int8 convrot).
+  unloaded quantized weight), quantized bases (bf16, fp8-e4m3, int8 convrot),
+  and the vision-less-encoder encode guard (meta-device visual params →
+  actionable RuntimeError; text-only encodes unaffected).
 
 ## The tiny model laws (violating any → confusing crashes hours later)
 
@@ -74,4 +77,4 @@
   only when NaN-free can't be guaranteed (weightless models emit NaNs!).
 - `INPUT_TYPES` combos may be 1-element tuples `([...],)`; accept `(list, dict)`
   too.
-- Full suite ≈ 42 tests in ~10–25 s, ~2 GB RAM peak.
+- Full suite ≈ 44 tests in ~10–25 s, ~2 GB RAM peak.

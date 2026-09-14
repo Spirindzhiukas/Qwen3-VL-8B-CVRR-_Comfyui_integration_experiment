@@ -178,7 +178,12 @@ Caveats (documented in the README):
   Non-CVRR encodes are unaffected either way (gating, not weights, decides).
 - Text-only Qwen3 encoders — Klein's stock `qwen_3_8b` TE — cannot host CVRR
   at all (no vision tower, and the encoder config itself is Qwen3 not
-  Qwen3-VL); the node raises with guidance instead of failing later.
+  Qwen3-VL); the node raises with guidance instead of failing later.  The same
+  applies to *Qwen3-VL* files exported **without the vision tower**
+  (text-only / `--drop-vision` conversions): never-loaded visual modules stay
+  on meta tensors under dynamic VRAM and previously crashed the first image
+  encode — now refused at encode time with an actionable error, and flagged
+  with a warning + `cvrr_no_vision` marker at build in the dedicated loader.
 - Quantized bases (bf16 casts, scaled fp8, int8 tensor-including-convrot, and
   other `QuantizedTensor` layouts) are handled by construction: the wrap
   contract needs only a logical-shape `.weight` and ComfyUI's own dequantizing
@@ -249,7 +254,7 @@ an empirical question that needs a GPU and the real weights.
 
 ## 7. What has actually been verified
 
-`42 tests, all green on CPU` (`pytest`, with a ComfyUI checkout at
+`44 tests, all green on CPU` (`pytest`, with a ComfyUI checkout at
 `COMFYUI_PATH`) — see `tests/`:
 
 * `test_cvrr_core.py` — algorithm: mode-vs-reference equality, FP32 transition
@@ -301,7 +306,7 @@ downloaded.
 
 ```
 comfyui_cvrr/          the custom node pack (see §5)
-tests/                 42 CPU tests (tiny stand-in config, real ComfyUI modules)
+tests/                 44 CPU tests (tiny stand-in config, real ComfyUI modules)
 examples/              klein9b_cvrr_edit.json — ready-to-load ComfyUI workflow
 docs/FEASIBILITY.md    this document
 ```

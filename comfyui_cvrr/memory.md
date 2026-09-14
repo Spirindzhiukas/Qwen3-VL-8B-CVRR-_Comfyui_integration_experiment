@@ -48,6 +48,15 @@
    Contract = logical-shape `.weight` + dequantizing forward. `MergedProjection`
    shape check reads `.shape` (logical); a `quant_format`-tagged module with
    `.weight is None` = "not finished loading" → clear error.
+8. **Vision-less files are refused at encode, flagged at load.** A text-only /
+   `--drop-vision` export leaves ComfyUI's visual modules on META tensors under
+   dynamic VRAM (never loaded ⇒ never staged) — the first image encode used to
+   implode with `Cannot copy out of meta tensor`. `CVRRTextModel.preprocess_embed`
+   now raises an actionable error when visual params are meta (text-only encodes
+   unaffected), and `build_clip` sets `te.cvrr_no_vision` + warns when the file
+   has no `visual.*` keys (surfaced in the loader's info string). Note: on a CPU
+   build the same missing weights are *uninitialized cpu garbage*, not meta —
+   detection there relies on the build-time flag, not the runtime guard.
 
 ## Retrofit path (option C)
 

@@ -9,7 +9,7 @@ stay in context.
 
 * **Feasibility write-up:** [`docs/FEASIBILITY.md`](docs/FEASIBILITY.md)
 * **Example graph:** [`examples/klein9b_cvrr_edit.json`](examples/klein9b_cvrr_edit.json)
-* **Tests:** 42 CPU tests (`pytest` in this directory), run against the real
+* **Tests:** 44 CPU tests (`pytest` in this directory), run against the real
   ComfyUI modules — no ComfyUI patching, nothing is monkey-patched at import.
 
 ## Why this exists
@@ -143,7 +143,7 @@ stock encoder. Two notes:
 ## Tests
 
 ```bash
-COMFYUI_PATH=~/ComfyUI pytest     # 42 tests, CPU only, ~2 GB RAM
+COMFYUI_PATH=~/ComfyUI pytest     # 44 tests, CPU only, ~2 GB RAM
 ```
 
 `COMFYUI_PATH` defaults to `../ComfyUI_src`; without a checkout the
@@ -165,6 +165,13 @@ layout and attention mask, loader round-trips, and the converter's key mapping.
 * **Prompt weighting is rejected** on CVRR conditioning (the emitted token count
   differs from the tokenized prompt) — the encoder raises instead of silently
   mis-encoding.
+* **The encoder file must contain the vision tower.** A text-only export
+  (`--drop-vision`, or any LM-only Qwen3-VL safetensors) loads with `clip
+  missing: visual.*` warnings and leaves ComfyUI's visual modules on meta
+  tensors — previously dying at the first image encode with
+  `Cannot copy out of meta tensor`, now refused early with an actionable
+  error. The loader flags such files (`vision_tower=MISSING` in the info
+  output and a log warning at build); text-only prompts still work on them.
 * Flowing CVRR states into Klein's TE slot is a **distribution shift** for the
   diffusion model (Klein was trained on plain Qwen3-8B states). It is valid
   conditioning; whether it improves edits is the experiment this repository

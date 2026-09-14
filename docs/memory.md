@@ -22,8 +22,8 @@
 ## Numbers that must stay in sync when tests change
 
 - Test count appears in: `README.md` header bullet *and* the pytest block
-  comment, `docs/FEASIBILITY.md` §7 heading + §9 layout line. Current: **42**
-  (core 16, integration 6, converter 4, loader 3, nodes 13). Use
+  comment, `docs/FEASIBILITY.md` §7 heading + §9 layout line. Current: **44**
+  (core 16, integration 6, converter 4, loader 4, nodes 14). Use
   `pytest --collect-only -q | tail -6` to recount.
 
 ## Option summary (for quick recall)

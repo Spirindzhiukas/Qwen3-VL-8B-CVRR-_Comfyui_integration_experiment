@@ -151,6 +151,30 @@ class CVRRTextModel(comfy.text_encoders.qwen3vl.Qwen3VL):
         self.cvrr_transition: Optional[MergedTransition] = None
         self.last_cvrr_result: Optional[CVRREncodeResult] = None
 
+    # -- guards ------------------------------------------------------------
+
+    def preprocess_embed(self, embed, device):
+        """Refuse image encodes on a vision-less (text-only export) encoder.
+
+        A checkpoint shipped without the vision tower (``--drop-vision``, or an
+        LM-only safetensors file) leaves the visual modules' parameters on the
+        meta device forever (ComfyUI stages only parameters it actually has).
+        The first image encode then dies deep inside the vision forward with
+        ``NotImplementedError: Cannot copy out of meta tensor`` -- catch it here
+        with a message that says what to do.  Text-only encodes are untouched.
+        """
+        if isinstance(embed, dict) and embed.get("type") == "image":
+            visual = getattr(self, "visual", None)
+            if visual is None or any(p.is_meta for p in visual.parameters()):
+                raise RuntimeError(
+                    "comfyui_cvrr: this text encoder has no usable vision tower "
+                    "(its visual.* weights are missing -- e.g. a text-only or "
+                    "--drop-vision export), so it cannot process images. Load the "
+                    "full Qwen3-VL(-8B) encoder file (the converted CVRR backbone "
+                    "or a vision-complete finetune). Text-only prompts keep working."
+                )
+        return super().preprocess_embed(embed, device)
+
     # -- configuration ----------------------------------------------------
 
     def configure_cvrr(
@@ -457,6 +481,18 @@ def build_clip(
     te = clip.cond_stage_model
     if not isinstance(te, CVRRTE):
         raise RuntimeError(f"comfyui_cvrr: unexpected text encoder class {type(te)!r}")
+
+    # Vision coverage: a --drop-vision / LM-only export leaves the visual
+    # modules on meta device and only explodes at the first image encode, so
+    # flag it here (warning + marker for the loader's info string).
+    te.cvrr_no_vision = not any("visual." in key for key in state_dict)
+    if te.cvrr_no_vision:
+        log.warning(
+            "comfyui_cvrr: %s contains no vision tower weights (no visual.* "
+            "keys); the CLIP is text-only and image encodes will refuse to run. "
+            "Convert the full Qwen3-VL backbone (without --drop-vision).",
+            clip_path,
+        )
 
     te.configure_cvrr(spec=spec, mode=mode)
     if transition_path:

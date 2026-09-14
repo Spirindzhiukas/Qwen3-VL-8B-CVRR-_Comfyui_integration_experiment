@@ -202,11 +202,13 @@ class CVRRTextEncoderLoader:
             mode=mode,
             transition_path=transition_path,
         )
+        no_vision = getattr(getattr(clip, "cond_stage_model", None), "cvrr_no_vision", False)
         info = (
             f"CVRR {spec.name}: ell_star={spec.ell_star} recurrent_layer={spec.recurrent_layer} "
             f"upper_decoder={spec.upper_decoder_start} T={spec.num_recurrent_steps} "
             f"beta={spec.beta} mode={mode} merged_transition="
-            f"{'yes' if transition_path else 'NO (recurrence disabled)'}"
+            f"{'yes' if transition_path else 'NO (recurrence disabled)'} "
+            f"vision_tower={'MISSING (text-only file, images disabled)' if no_vision else 'yes'}"
         )
         return (clip, info)
 

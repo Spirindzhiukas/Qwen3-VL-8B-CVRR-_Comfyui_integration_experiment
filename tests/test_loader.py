@@ -94,3 +94,23 @@ def test_apply_transition_enables_recurrence(comfy, tiny_checkpoint, spec):
     # mode/step settings are still applied after the weights land
     options = clip.cond_stage_model.text_model.cvrr_options
     assert options is not None and options.spec.num_recurrent_steps == 4
+
+
+def test_build_clip_flags_a_visionless_file(comfy, tiny_checkpoint, tmp_path, caplog):
+    """A converted file without visual.* keys is flagged at load time."""
+    import logging
+
+    import comfyui_cvrr.cvrr_te as cvrr_te
+    from safetensors.torch import load_file, save_file
+
+    encoder_path, _transition_path, spec = tiny_checkpoint
+    state = load_file(str(encoder_path))
+    text_only = {k: v for k, v in state.items() if "visual." not in k}
+    text_only_path = tmp_path / "cvrr_tiny_textonly.safetensors"
+    save_file(text_only, str(text_only_path))
+
+    with caplog.at_level(logging.WARNING):
+        clip = cvrr_te.build_clip(str(text_only_path), device="cpu", spec=spec,
+                                  mode="aligned", model_type=TINY_MODEL_TYPE)
+    assert clip.cond_stage_model.cvrr_no_vision is True
+    assert any("vision tower" in record.getMessage() for record in caplog.records)
