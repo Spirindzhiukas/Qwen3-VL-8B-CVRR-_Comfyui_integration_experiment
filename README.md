@@ -96,12 +96,14 @@ More reference images: feed the conditioning through extra
 ## Tests
 
 ```bash
-pytest                       # 35 tests, CPU only, ~2 GB RAM
+COMFYUI_PATH=~/ComfyUI pytest     # 35 tests, CPU only, ~2 GB RAM
 ```
 
-The suite runs the algorithm and the integration against real ComfyUI classes at
-tiny dimensions (a stand-in Qwen3-VL config), so it needs a ComfyUI checkout on
-`PYTHONPATH` (or installed) but no GPU and no weights. It covers
+`COMFYUI_PATH` defaults to `../ComfyUI_src`; without a checkout the
+ComfyUI-backed tests are skipped instead of failing. The suite runs the
+*algorithm* and the *integration* against real ComfyUI classes at tiny
+dimensions (a stand-in Qwen3-VL config registered under a private `model_type`),
+so it needs a ComfyUI checkout but no GPU and no weights. It covers
 algorithm↔reference equivalence, the merged-transition machinery, Klein's token
 layout and attention mask, loader round-trips, and the converter's key mapping.
 
