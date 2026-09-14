@@ -336,3 +336,195 @@ def test_apply_transition_rejects_shape_mismatched_weights(comfy, nodes_module,
     with pytest.raises(ValueError, match="mismatch"):
         nodes_module.CVRRApplyTransition().apply(
             clip=clip, merged_transition="cvrr/cvrr_merged_transition.safetensors")
+
+
+# ---------------------------------------------------------------------------
+# Quantized / low-precision base encoders (bf16, fp8, int8 incl. convrot)
+# ---------------------------------------------------------------------------
+
+
+def _mixed_precision_tiny_clip(comfy, quantization):
+    """A stock tiny CLIP built the way a quantized checkpoint loads: with
+    ``model_options['quantization_metadata']``, so projections are
+    ``mixed_precision_ops`` modules (the same object state as after
+    ``CLIPLoader`` ingests a scaled fp8/int8 text encoder file)."""
+    import comfy.sd
+    import comfy.supported_models_base
+    import comfy.text_encoders.flux as flux
+    import comfy.text_encoders.qwen3vl as qwen3vl
+
+    def _clip_model(**kw):
+        return qwen3vl.Qwen3VLClipModel(**kw, model_type=TINY_MODEL_TYPE)
+
+    class _StockTE(flux.Flux2TEModel):
+        def __init__(self, device="cpu", dtype=None, model_options={}):
+            model_options = dict(model_options)
+            model_options["quantization_metadata"] = quantization
+            super().__init__(device=device, dtype=dtype, model_options=model_options,
+                             name=TINY_MODEL_TYPE, clip_model=_clip_model)
+
+    cpu = torch.device("cpu")
+    torch.manual_seed(4321)
+    # Build the TE *module* first: ``comfy.sd.CLIP.__init__`` probes module
+    # dtypes immediately, and mixed-precision Linears only get .weight when a
+    # state dict fills them in, so the real loader constructs CLIP with the
+    # state dict already attached.  Reproduce that: init the weightless
+    # modules by geometry, load the random state, then wrap by hand.
+    te = _StockTE(device="cpu", dtype=torch.float32)
+    for module in te.modules():
+        in_f = getattr(module, "in_features", None)
+        out_f = getattr(module, "out_features", None)
+        if in_f is not None and out_f is not None and getattr(module, "weight", None) is None:
+            module.weight = torch.nn.Parameter(
+                torch.randn(int(out_f), int(in_f)) * 0.05, requires_grad=False)
+        bias = getattr(module, "bias", None)
+        if isinstance(bias, torch.nn.Parameter) and not torch.isfinite(bias.detach().float()).all():
+            bias.data = torch.randn_like(bias.detach().float()) * 0.05
+    state = {k: torch.randn(v.shape, dtype=torch.float32) * 0.05
+             for k, v in te.state_dict().items() if v.is_floating_point()}
+    te.load_state_dict(state, strict=False)
+
+    import comfy.hooks
+    import comfy.model_patcher
+
+    clip = comfy.sd.CLIP(no_init=True)
+    clip.cond_stage_model = te
+    clip.patcher = comfy.model_patcher.CoreModelPatcher(
+        te, load_device=cpu, offload_device=cpu)
+    clip.patcher.set_model_compute_dtype(torch.float32)
+    clip.patcher.hook_mode = comfy.hooks.EnumHookMode.MinVram
+    clip.patcher.is_clip = True
+    clip.tokenizer = qwen3vl.tokenizer(model_type=TINY_MODEL_TYPE)()
+    clip.layer_idx = None
+    clip.use_clip_schedule = False
+    clip.tokenizer_options = {}
+    clip.apply_hooks_to_conds = None
+    return clip
+
+
+def _quantize_clip_weights(clip, spec, fmt, convrot=False):
+    """Replace the recurrent layer's projections (plus one control projection)
+    with Parameter-wrapped ``QuantizedTensor`` weights, reproducing the
+    post-load state of a scaled fp8/int8 checkpoint."""
+    from comfy.quant_ops import QuantizedTensor, TensorCoreFP8E4M3Layout, TensorWiseINT8Layout
+
+    from comfyui_cvrr.cvrr_core import MERGED_PROJECTION_PATHS
+
+    model = getattr(clip.cond_stage_model, clip.cond_stage_model.clip)
+    layers = model.transformer.model.layers
+    targets = [(layers[spec.recurrent_layer], path) for path in MERGED_PROJECTION_PATHS]
+    targets.append((layers[0], "self_attn.q_proj"))  # control: outside the recurrent layer
+    for owner, path in targets:
+        module = owner
+        parts = path.split(".")
+        for part in parts[:-1]:
+            module = getattr(module, part)
+        module = getattr(module, parts[-1])
+        weight = module.weight.detach().float()
+        if fmt == "float8_e4m3fn":
+            quantized = TensorCoreFP8E4M3Layout.quantize(weight, scale="recalculate")
+            if not isinstance(quantized, QuantizedTensor):
+                quantized = QuantizedTensor(quantized[0], "TensorCoreFP8E4M3Layout", quantized[1])
+        elif fmt == "int8_tensorwise":
+            kwargs = {"convrot": convrot}
+            if convrot:
+                # convrot int8 is defined per-channel (the layout rejects
+                # tensor-wise rotation) and the Hadamard group must be a power
+                # of 4 dividing the input width (256 for the real 8B; the tiny
+                # model's 32-wide projections take 16).
+                kwargs["per_channel"] = True
+                kwargs["convrot_groupsize"] = next(
+                    g for g in (256, 64, 16, 4) if weight.shape[1] % g == 0)
+            qdata, params = TensorWiseINT8Layout.quantize(weight, scale="recalculate", **kwargs)
+            quantized = QuantizedTensor(qdata, "TensorWiseINT8Layout", params)
+        else:
+            raise ValueError(fmt)
+        module.weight = torch.nn.Parameter(quantized, requires_grad=False)
+        module.quant_format = fmt
+        module._full_precision_mm = True  # TE default: dequantize on compute (CPU-safe)
+    return clip
+
+
+def _run_roundtrip(nodes_module, clip, patched, spec, image):
+    """Shared assertions for the attach + encode on a low-precision base."""
+    with torch.no_grad():
+        baseline = clip.encode_from_tokens_scheduled(clip.tokenize("a small robot", images=[image]))
+
+    assert getattr(patches := patched, "cvrr_attachment", None) is not None or patches
+    model = getattr(patched.cond_stage_model, patched.cond_stage_model.clip)
+    transition = model.transformer.cvrr_transition
+    assert transition is not None
+    assert all(p.merged_weight.dtype == torch.float32 for p in transition.projections), \
+        "merged weights must stay fp32 regardless of base storage dtype"
+
+    cond, _ = nodes_module.CVRRTextEncode().encode(clip=patched, prompt="a small robot",
+                                                   mode="aligned", vl_megapixels=0.0, image=image)
+    tensor = cond[0][0]
+    assert tensor.shape[0] == 1 and tensor.shape[2] == 3 * TINY_DIM
+
+    # The same encoder still serves the original handle identically (gating, not weights).
+    with torch.no_grad():
+        after = clip.encode_from_tokens_scheduled(clip.tokenize("a small robot", images=[image]))
+    assert torch.allclose(after[0][0], baseline[0][0])
+    return baseline, tensor
+
+
+def test_apply_transition_on_a_bf16_clip(comfy, nodes_module, monkeypatch,
+                                         tmp_path, tiny_spec_in_nodes):
+    spec = tiny_spec_in_nodes
+    clip = _stock_tiny_clip(comfy)
+    clip.cond_stage_model.to(torch.bfloat16)
+    path = _write_transition(clip, spec, tmp_path)
+    _serve_file(monkeypatch, nodes_module, "cvrr/cvrr_merged_transition.safetensors", path)
+
+    image = torch.rand(1, 64, 64, 3)
+    patched, _ = nodes_module.CVRRApplyTransition().apply(
+        clip=clip, merged_transition="cvrr/cvrr_merged_transition.safetensors")
+    _run_roundtrip(nodes_module, clip, patched, spec, image)
+
+
+def test_apply_transition_on_an_fp8_e4m3_clip(comfy, nodes_module, monkeypatch,
+                                              tmp_path, tiny_spec_in_nodes):
+    spec = tiny_spec_in_nodes
+    clip = _mixed_precision_tiny_clip(comfy, {"format": "float8_e4m3fn"})
+    _quantize_clip_weights(clip, spec, "float8_e4m3fn")
+    path = _write_transition(clip, spec, tmp_path)
+    _serve_file(monkeypatch, nodes_module, "cvrr/cvrr_merged_transition.safetensors", path)
+
+    image = torch.rand(1, 64, 64, 3)
+    patched, _ = nodes_module.CVRRApplyTransition().apply(
+        clip=clip, merged_transition="cvrr/cvrr_merged_transition.safetensors")
+    _run_roundtrip(nodes_module, clip, patched, spec, image)
+
+
+def test_apply_transition_on_an_int8_convrot_clip(comfy, nodes_module, monkeypatch,
+                                                  tmp_path, tiny_spec_in_nodes):
+    spec = tiny_spec_in_nodes
+    clip = _mixed_precision_tiny_clip(comfy, {"format": "int8_tensorwise"})
+    _quantize_clip_weights(clip, spec, "int8_tensorwise", convrot=True)
+    path = _write_transition(clip, spec, tmp_path)
+    _serve_file(monkeypatch, nodes_module, "cvrr/cvrr_merged_transition.safetensors", path)
+
+    image = torch.rand(1, 64, 64, 3)
+    patched, _ = nodes_module.CVRRApplyTransition().apply(
+        clip=clip, merged_transition="cvrr/cvrr_merged_transition.safetensors")
+    _run_roundtrip(nodes_module, clip, patched, spec, image)
+
+
+def test_apply_transition_rejects_an_unloaded_quantized_weight(comfy, nodes_module,
+                                                               monkeypatch, tmp_path,
+                                                               tiny_spec_in_nodes):
+    spec = tiny_spec_in_nodes
+    clip = _mixed_precision_tiny_clip(comfy, {"format": "int8_tensorwise"})
+    _quantize_clip_weights(clip, spec, "int8_tensorwise")
+    path = _write_transition(clip, spec, tmp_path)
+    _serve_file(monkeypatch, nodes_module, "cvrr/cvrr_merged_transition.safetensors", path)
+
+    # Simulate a projection whose quantized weight has not finished streaming in.
+    model = getattr(clip.cond_stage_model, clip.cond_stage_model.clip)
+    proj = model.transformer.model.layers[spec.recurrent_layer].self_attn.q_proj
+    proj.weight = None
+
+    with pytest.raises(ValueError, match="not finished loading"):
+        nodes_module.CVRRApplyTransition().apply(
+            clip=clip, merged_transition="cvrr/cvrr_merged_transition.safetensors")

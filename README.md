@@ -9,7 +9,7 @@ stay in context.
 
 * **Feasibility write-up:** [`docs/FEASIBILITY.md`](docs/FEASIBILITY.md)
 * **Example graph:** [`examples/klein9b_cvrr_edit.json`](examples/klein9b_cvrr_edit.json)
-* **Tests:** 38 CPU tests (`pytest` in this directory), run against the real
+* **Tests:** 42 CPU tests (`pytest` in this directory), run against the real
   ComfyUI modules — no ComfyUI patching, nothing is monkey-patched at import.
 
 ## Why this exists
@@ -116,6 +116,14 @@ stock encoder. Two notes:
   the same loader output, so attaching a *different* transition file replaces
   the previous one for all of them (same caveat as any LoRA-relevant mutation
   of a cached model; attaching the same file twice is just a refresh).
+- **Quantized base encoders are supported.** The merged weights stay fp32
+  regardless of base storage, and the base projections are used through their
+  own forward (so their dequantization keeps working). Verified in tests:
+  bf16 (plain cast), fp8 `float8_e4m3fn` (scaled, mixed-precision ops),
+  `int8_tensorwise` including **convrot** (per-channel, Hadamard-rotated).
+  Other `QuantizedTensor` layouts (e5m2, NVFP4, W4A8/AWQ…) work by the same
+  contract: the projection must expose its logical-shape `.weight` and a
+  dequantizing forward; anything past-load ComfyUI produces satisfies that.
 - The released transition was trained against the instruct Qwen3-VL-8B
   backbone; on a diverged finetune the mechanics hold, but the visual
   recurrence targets different activations — expect the quality question mark
@@ -124,7 +132,7 @@ stock encoder. Two notes:
 ## Tests
 
 ```bash
-COMFYUI_PATH=~/ComfyUI pytest     # 38 tests, CPU only, ~2 GB RAM
+COMFYUI_PATH=~/ComfyUI pytest     # 42 tests, CPU only, ~2 GB RAM
 ```
 
 `COMFYUI_PATH` defaults to `../ComfyUI_src`; without a checkout the

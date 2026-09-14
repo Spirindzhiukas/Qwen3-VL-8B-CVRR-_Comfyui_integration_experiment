@@ -176,6 +176,11 @@ Caveats (documented in the README):
 - Text-only Qwen3 encoders — Klein's stock `qwen_3_8b` TE — cannot host CVRR
   at all (no vision tower, and the encoder config itself is Qwen3 not
   Qwen3-VL); the node raises with guidance instead of failing later.
+- Quantized bases (bf16 casts, scaled fp8, int8 tensor-including-convrot, and
+  other `QuantizedTensor` layouts) are handled by construction: the wrap
+  contract needs only a logical-shape `.weight` and ComfyUI's own dequantizing
+  forward; the merged weight itself always stays fp32 dense. Tests cover the
+  bf16 / fp8-e4m3 / int8-convrot attach+encode roundtrip.
 - Same-shape finetunes work mechanically; the release transition was trained
   against the instruct backbone's activations, so quality is a finetune-
   distance-dependent unknown (same open question as §6, amplified).
@@ -241,7 +246,7 @@ an empirical question that needs a GPU and the real weights.
 
 ## 7. What has actually been verified
 
-`38 tests, all green on CPU` (`pytest`, with a ComfyUI checkout at
+`42 tests, all green on CPU` (`pytest`, with a ComfyUI checkout at
 `COMFYUI_PATH`) — see `tests/`:
 
 * `test_cvrr_core.py` — algorithm: mode-vs-reference equality, FP32 transition
@@ -263,8 +268,12 @@ an empirical question that needs a GPU and the real weights.
   and the §5a attach path: a *stock* `CLIPLoader`-style `Flux2TEModel` CLIP
   gets retrofitted, keeps producing bit-identical stock encodes for
   non-CVRR use, and encodes CVRR conditioning (deterministically, with the
-  stock state restored afterwards); vision-tower-less encoders and
-  shape-mismatched transitions are rejected with clear errors.
+  stock state restored afterwards); vision-tower-less encoders,
+  shape-mismatched transitions and not-yet-loaded quantized weights are
+  rejected with clear errors; the attach+encode roundtrip is additionally
+  exercised on bf16, scaled fp8 (`float8_e4m3fn`, mixed-precision ops) and
+  `int8_tensorwise` **with convrot** base encoders, proving the wrap is
+  storage-format agnostic and keeps the merged weights in fp32.
 
 Not verified (no GPU, no weights in this sandbox): real 8B inference, output
 quality, speed, VRAM. The 17.5 GB backbone and the 772 MB transition were never
@@ -289,7 +298,7 @@ downloaded.
 
 ```
 comfyui_cvrr/          the custom node pack (see §5)
-tests/                 38 CPU tests (tiny stand-in config, real ComfyUI modules)
+tests/                 42 CPU tests (tiny stand-in config, real ComfyUI modules)
 examples/              klein9b_cvrr_edit.json — ready-to-load ComfyUI workflow
 docs/FEASIBILITY.md    this document
 ```

@@ -183,14 +183,45 @@ class MergedProjection(nn.Module):
     Mirrors ``NativeMergedLinear`` from the released ``modeling_cvrr_merged.py``:
     the merged weight is kept in float32 and never truncated by a cast of the
     surrounding module.
+
+    The wrapped ``base`` may be *any* module with a ``forward`` that computes
+    ``x @ W.T`` for a logical weight of the merged weight's shape, in whatever
+    storage format it likes -- plain ``nn.Linear`` (fp32/bf16/fp16), ComfyUI's
+    ``fp8_ops``/``manual_cast`` Linears, or the mixed-precision quant modules
+    whose ``weight`` is a ``QuantizedTensor`` (``float8_e4m3fn``/``e5m2``,
+    ``int8_tensorwise`` with or without convrot, NVFP4, ...).  ``QuantizedTensor``
+    subclasses report the **logical** shape via ``.shape``, so the check below
+    sees through them.
     """
 
     def __init__(self, base: nn.Module, merged_weight: torch.Tensor):
         super().__init__()
-        if base.weight is not None and tuple(base.weight.shape) != tuple(merged_weight.shape):
+        weight = getattr(base, "weight", None)
+        if weight is None:
+            quantized = getattr(base, "quant_format", None)
+            if quantized is not None:
+                raise ValueError(
+                    "merged projection on a quantized layer is not possible yet: the "
+                    f"{quantized}-quantized weights have not finished loading "
+                    "(module has no .weight). Load/prepare the base checkpoint "
+                    "before attaching merged_transition.safetensors."
+                )
+            # Weightless module (e.g. tensors still streaming in): validate
+            # against the fused geometry if it is discoverable.
+            in_f = getattr(base, "in_features", None)
+            out_f = getattr(base, "out_features", None)
+            if in_f is not None and out_f is not None and (
+                (int(in_f), int(out_f)) != (int(merged_weight.shape[1]), int(merged_weight.shape[0]))
+            ):
+                raise ValueError(
+                    "merged projection shape mismatch: base declares "
+                    f"{out_f}x{in_f} but merged weight is {tuple(merged_weight.shape)}"
+                )
+        elif tuple(weight.shape) != tuple(merged_weight.shape):
             raise ValueError(
                 "merged projection shape mismatch: "
-                f"{tuple(base.weight.shape)} != {tuple(merged_weight.shape)}"
+                f"{tuple(weight.shape)} (storage dtype {weight.dtype}) != "
+                f"{tuple(merged_weight.shape)}"
             )
         self.base = base
         self.enabled = False
@@ -276,6 +307,7 @@ def install_merged_transition(
     ``layer.mlp.gate_proj``, ...); the released file uses the same sub-paths.
     """
     weights = merged_transition_keys(state_dict)
+    resolved = []
     projections = []
     for path in MERGED_PROJECTION_PATHS:
         parent = layer
@@ -284,13 +316,20 @@ def install_merged_transition(
             parent = getattr(parent, part)
         name = parts[-1]
         base = getattr(parent, name)
+        resolved.append((parent, name, base, path))
         if isinstance(base, MergedProjection):  # already installed, refresh weights
             base.merged_weight.copy_(weights[f"{path}.weight"].float())
             projections.append(base)
             continue
-        wrapped = MergedProjection(base, weights[f"{path}.weight"])
-        setattr(parent, name, wrapped)
+        try:
+            wrapped = MergedProjection(base, weights[f"{path}.weight"])
+        except ValueError as exc:
+            raise ValueError(f"merged transition unusable at {path!r}: {exc}") from exc
         projections.append(wrapped)
+    # all seven validated; only now rewire the modules (atomic install)
+    for (parent, name, base, path), wrapped in zip(resolved, projections):
+        if base is not wrapped:
+            setattr(parent, name, wrapped)
     return MergedTransition(layer, projections)
 
 
