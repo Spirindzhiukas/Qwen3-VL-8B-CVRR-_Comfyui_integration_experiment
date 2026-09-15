@@ -77,4 +77,4 @@
   only when NaN-free can't be guaranteed (weightless models emit NaNs!).
 - `INPUT_TYPES` combos may be 1-element tuples `([...],)`; accept `(list, dict)`
   too.
-- Full suite ≈ 44 tests in ~10–25 s, ~2 GB RAM peak.
+- Full suite ≈ 48 tests in ~10–25 s, ~2 GB RAM peak.

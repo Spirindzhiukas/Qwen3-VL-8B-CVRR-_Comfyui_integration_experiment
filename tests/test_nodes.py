@@ -15,7 +15,7 @@ import types
 import pytest
 import torch
 
-from tests.conftest import TINY_DIM, TINY_MODEL_TYPE
+from tests.conftest import TINY_DIM, TINY_MODEL_TYPE, TINY_TAPS
 
 pytestmark = pytest.mark.comfy
 
@@ -108,6 +108,32 @@ def test_encode_nodes_accept_images_and_report_info(nodes_module):
     inputs = nodes.NODE_CLASS_MAPPINGS["CVRREditTextEncode"].INPUT_TYPES()
     assert inputs["required"]["vae"][0] == "VAE"
     assert "reference_latents_method" in inputs["optional"]
+
+
+def test_tooltips_document_release_semantics(nodes_module):
+    """The knobs the user must not confuse with sampler settings carry tooltips
+    that say so explicitly (recurrence count, release defaults, ref edge)."""
+    nodes = nodes_module
+    apply_inputs = nodes.CVRRApplyTransition.INPUT_TYPES()
+    opt = apply_inputs["optional"]
+    steps_tip = opt["inference_steps"][1]["tooltip"].lower()
+    assert "recurrence" in steps_tip and "sampler" in steps_tip
+    assert "4" in steps_tip  # release T
+    blocksize_tip = opt["blocksize"][1]["tooltip"].lower()
+    assert "release" in blocksize_tip
+    beta_tip = opt["beta"][1]["tooltip"].lower()
+    assert "0.33" in beta_tip
+
+    edit_inputs = nodes.CVRREditTextEncode.INPUT_TYPES()
+    edge = edit_inputs["required"]["ref_longest_edge"]
+    assert edge[1]["default"] == 1024 and edge[1]["min"] >= 64 and edge[1]["max"] >= 4096
+    assert "ref_longest_edge" in edge[1]["tooltip"]
+    method = edit_inputs["optional"]["reference_latents_method"]
+    assert method[0] == ["index", "offset", "uxo", "index_timestep_zero"]
+    assert "mode" in edit_inputs["required"] and edit_inputs["required"]["mode"][1]["tooltip"]
+
+    encode_inputs = nodes.CVRRTextEncode.INPUT_TYPES()
+    assert encode_inputs["required"]["vl_megapixels"][1]["default"] >= 1.0
 
 
 def test_parse_tap_gains(nodes_module):
@@ -572,3 +598,170 @@ def test_cvrr_encode_refuses_a_visionless_encoder(comfy, nodes_module, monkeypat
     cond, _ = nodes_module.CVRRTextEncode().encode(clip=patched, prompt="text only, no image",
                                                    mode="aligned", vl_megapixels=0.0)
     assert cond[0][0].shape[0] == 1 and cond[0][0].numel() > 0  # ran, layout covered elsewhere
+
+
+# ---------------------------------------------------------------------------
+# CVRREditTextEncode: ``ref_longest_edge`` size derivation and metadata
+# ---------------------------------------------------------------------------
+
+
+class _StubVAE:
+    """Records the image tensor it was asked to encode."""
+
+    def __init__(self):
+        self.last_shape = None
+
+    def encode(self, image):
+        self.last_shape = tuple(image.shape)
+        return torch.zeros(1, 3)
+
+
+def _patched_clip(comfy, nodes_module, monkeypatch, tmp_path, tiny_spec_in_nodes):
+    nodes = nodes_module
+    spec = tiny_spec_in_nodes
+    clip = _stock_tiny_clip(comfy)
+    path = _write_transition(clip, spec, tmp_path)
+    _serve_file(monkeypatch, nodes_module, TRANSITION_ENTRY, path)
+    patched, _ = nodes.CVRRApplyTransition().apply(
+        clip=clip, merged_transition=TRANSITION_ENTRY)
+    return patched
+
+
+def test_edit_node_ref_longest_edge_sizing(comfy, nodes_module, monkeypatch,
+                                           tmp_path, tiny_spec_in_nodes):
+    nodes = nodes_module
+    patched = _patched_clip(comfy, nodes_module, monkeypatch, tmp_path,
+                            tiny_spec_in_nodes)
+    node = nodes.CVRREditTextEncode()
+    vae = _StubVAE()
+
+    # 1999x1537 source with a 1024 target: longest edge lands on 1024, the
+    # shorter edge is rounded down to a multiple of 32 (no upscaling).
+    big = torch.rand(1, 1537, 1999, 3)
+    pos, neg, width, height, info = node.encode(
+        clip=patched, vae=vae, prompt="cvrr edit", image=big,
+        mode="aligned", ref_longest_edge=1024)
+    assert (width, height) == (1024, 800)
+    assert vae.last_shape == (1, height, width, 3)
+    assert "method=index" in info
+    refs = pos[0][1]["reference_latents"]
+    assert len(refs) == 1
+    assert pos[0][1]["reference_latents_method"] == "index"
+    assert neg[0][1].get("pooled_output") is None
+
+    # A source smaller than the target keeps its natural size (never upscale).
+    small = torch.rand(1, 32, 64, 3)
+    _, _, width2, height2, _ = node.encode(
+        clip=patched, vae=vae, prompt="cvrr edit", image=small,
+        mode="aligned", ref_longest_edge=1024)
+    assert (width2, height2) == (64, 32)
+
+    # Shrink the VL edge cap for the test: an oversized source is clamped to
+    # the cap, not to the requested target edge.
+    monkeypatch.setattr(nodes_module, "VL_EDGE_CAP", 256)
+    huge = torch.rand(1, 480, 640, 3)
+    _, _, width3, height3, info3 = node.encode(
+        clip=patched, vae=vae, prompt="cvrr edit", image=huge,
+        mode="aligned", ref_longest_edge=4096)
+    assert (width3, height3) == (256, 192)
+    assert "ref=256x192" in info3
+
+
+# ---------------------------------------------------------------------------
+# CVRRTextEncodePlain: text-prompt parity with the stock encode
+# ---------------------------------------------------------------------------
+
+
+def test_plain_node_matches_stock_text_encode(comfy, nodes_module, monkeypatch,
+                                              tmp_path, tiny_spec_in_nodes):
+    nodes = nodes_module
+    patched = _patched_clip(comfy, nodes_module, monkeypatch, tmp_path,
+                            tiny_spec_in_nodes)
+
+    # No image -> no recurrence: the plain node must be bit-identical to the
+    # stock text encode of the same encoder.
+    tokens = patched.tokenize("a small robot")
+    with torch.no_grad():
+        expected = patched.encode_from_tokens_scheduled(tokens)
+    cond, info = nodes.CVRRTextEncodePlain().encode(clip=patched, prompt="a small robot")
+    assert torch.equal(cond[0][0], expected[0][0])
+    assert "ell_star" in info
+
+    # ... and the stock encode afterwards is unchanged (no state leaks).
+    with torch.no_grad():
+        again = patched.encode_from_tokens_scheduled(tokens)
+    assert torch.equal(again[0][0], expected[0][0])
+
+
+# ---------------------------------------------------------------------------
+# Retrofit onto non-Flux2 wrappers (e.g. ideogram4-style TEs)
+# ---------------------------------------------------------------------------
+
+
+def test_ideogram_style_wrapper_keeps_outer_class(comfy, nodes_module, monkeypatch,
+                                                  tmp_path, tiny_spec_in_nodes):
+    """A TE wrapper that is not a ``Flux2TEModel`` (ideogram4's TE is the
+    canonical case) must keep its own outer class and reshape: the retrofit
+    upgrades the *inner* transformer only, which makes ``CVRRTextEncodePlain``
+    (text-only) behave exactly like the wrapper's stock encode.
+    """
+    import comfy.sd
+    import comfy.supported_models_base
+    import comfy.text_encoders.qwen3vl as qwen3vl
+    import comfy.sd1_clip as sd1_clip
+
+    def _clip_model(**kw):
+        # A taps list at construction time is exactly how the real
+        # ``Ideogram4*ClipModel`` configures its 13 taps.
+        return qwen3vl.Qwen3VLClipModel(**kw, model_type=TINY_MODEL_TYPE,
+                                        layer=list(TINY_TAPS))
+
+    class _PseudoIdeogramTE(sd1_clip.SD1ClipModel):
+        """Mimics ideogram4's wrapper: own class, own tap stacking order."""
+
+        def __init__(self, device="cpu", dtype=None, model_options={}):
+            super().__init__(device=device, dtype=dtype, model_options=model_options,
+                             name=TINY_MODEL_TYPE, clip_model=_clip_model)
+
+        def encode_token_weights(self, token_weight_pairs):
+            out, pooled, extra = super().encode_token_weights(token_weight_pairs)
+            # ideogram4-style: (B, taps, seq, dim) -> tap-minor interleave, so
+            # the layout is provably this wrapper's own, not Klein's.
+            b, n, seq, h = out.shape
+            out = out.permute(0, 2, 3, 1).reshape(b, seq, h * n)
+            return out, pooled, extra
+
+    nodes = nodes_module
+    spec = tiny_spec_in_nodes
+    target = comfy.supported_models_base.ClipTarget(
+        qwen3vl.tokenizer(model_type=TINY_MODEL_TYPE), _PseudoIdeogramTE)
+    cpu = torch.device("cpu")
+    clip = comfy.sd.CLIP(target, model_options={"load_device": cpu, "offload_device": cpu})
+    torch.manual_seed(1234)
+    state = {k: torch.randn(v.shape, dtype=torch.float32) * 0.05
+             for k, v in clip.cond_stage_model.state_dict().items()
+             if v.is_floating_point()}
+    clip.cond_stage_model.load_state_dict(state, strict=False)
+    assert not isinstance(clip.cond_stage_model,
+                          __import__("comfy.text_encoders.flux", fromlist=["x"]).Flux2TEModel)
+
+    path = _write_transition(clip, spec, tmp_path)
+    _serve_file(monkeypatch, nodes_module, TRANSITION_ENTRY, path)
+    patched, info = nodes.CVRRApplyTransition().apply(
+        clip=clip, merged_transition=TRANSITION_ENTRY)
+
+    # Outer class is preserved; the inner transformer is the CVRR upgrade.
+    assert type(patched.cond_stage_model) is _PseudoIdeogramTE
+    assert nodes.is_cvrr_clip(patched)
+    inner = getattr(patched.cond_stage_model, patched.cond_stage_model.clip).transformer
+    assert type(inner).__name__ == "CVRRTextModel"
+
+    tokens = patched.tokenize("cvrr demo")
+    with torch.no_grad():
+        expected = patched.encode_from_tokens_scheduled(tokens)
+    # The wrapper's own reshape produced Klein-foreign conditioning width.
+    assert expected[0][0].shape[2] == 3 * TINY_DIM
+
+    cond, plain_info = nodes.CVRRTextEncodePlain().encode(clip=patched, prompt="cvrr demo")
+    assert torch.equal(cond[0][0], expected[0][0]), \
+        "plain text encode must match the wrapper's own stock encode"

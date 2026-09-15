@@ -254,7 +254,7 @@ an empirical question that needs a GPU and the real weights.
 
 ## 7. What has actually been verified
 
-`44 tests, all green on CPU` (`pytest`, with a ComfyUI checkout at
+`48 tests, all green on CPU` (`pytest`, with a ComfyUI checkout at
 `COMFYUI_PATH`) — see `tests/`:
 
 * `test_cvrr_core.py` — algorithm: mode-vs-reference equality, FP32 transition
@@ -306,7 +306,7 @@ downloaded.
 
 ```
 comfyui_cvrr/          the custom node pack (see §5)
-tests/                 44 CPU tests (tiny stand-in config, real ComfyUI modules)
+tests/                 48 CPU tests (tiny stand-in config, real ComfyUI modules)
 examples/              klein9b_cvrr_edit.json — ready-to-load ComfyUI workflow
 docs/FEASIBILITY.md    this document
 ```

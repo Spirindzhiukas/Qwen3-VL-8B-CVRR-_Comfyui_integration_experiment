@@ -9,7 +9,7 @@ stay in context.
 
 * **Feasibility write-up:** [`docs/FEASIBILITY.md`](docs/FEASIBILITY.md)
 * **Example graph:** [`examples/klein9b_cvrr_edit.json`](examples/klein9b_cvrr_edit.json)
-* **Tests:** 44 CPU tests (`pytest` in this directory), run against the real
+* **Tests:** 48 CPU tests (`pytest` in this directory), run against the real
   ComfyUI modules — no ComfyUI patching, nothing is monkey-patched at import.
 
 ## Why this exists
@@ -72,7 +72,8 @@ Add `--dry-run` to inspect the mapping without writing anything.
 | **CVRR Qwen3-VL Text Encoder Loader** | Loads the converted encoder + `cvrr_merged_transition.safetensors`; `mode` = `aligned` (default) / `strict` / `vl`; optional `blocksize`, `inference_steps`, `beta`, `tap_gains` overrides; reports the resolved CVRR geometry. |
 | **CVRR Apply Merged Transition** | **LoRA-style attach:** patches `merged_transition.safetensors` onto *any* already-loaded Qwen3-VL CLIP (stock `CLIPLoader` output with type `flux2`, or a Qwen3-VL-8B finetune — no converted file per finetune needed). Returns a new CLIP handle; the merged weights sit as gated fp32 buffers on the recurrent layer, so non-CVRR encodes of the same encoder are untouched. |
 | **CVRR Text Encode (Qwen3-VL / Klein)** | `CLIP Text Encode (Prompt)` for CVRR: prompt + optional image → `CONDITIONING` (+ info). |
-| **CVRR Edit Text Encode (Klein ref-latent)** | The Klein edit node: prompt + image + VAE → positive/negative `CONDITIONING`, **with the reference latent already appended** (equivalent to `CLIP Text Encode` → `VAEEncode` → `Set Reference Latent`). Optional second image, `reference_latents_method`, per-tap gains. |
+| **CVRR Text Encode (text-only prompt)** | Plain `CLIP Text Encode`: no image, no recurrence — conditioning in the *native layout* of whatever Qwen3-VL TE the CLIP carries (Klein's 3-tap stack, ideogram4's 13-tap interleave, ...). Use it to probe whether models with a native Qwen3-VL TE (e.g. ideogram_4) ingest our conditioning at all, before involving the visual recurrence. |
+| **CVRR Edit Text Encode (Klein ref-latent)** | The Klein edit node — a CVRR-capable take on EditUtils' *Flux2Klein Edit Text Encode*: prompt + image + VAE → positive/negative `CONDITIONING`, **with the reference latent already appended**. One `ref_longest_edge` (default 1024) drives the reference for *both* the VL tower and the VAE encode: never upscales the source, caps at 2048 px, rounds down to /32; the processed size is reported on the `width`/`height` INT outputs for chaining into e.g. `Empty Flux 2 Latent`. Optional second image, `reference_latents_method`, per-tap gains; the `info` string carries per-tap magnitude stats (μ/σ/|max|) for on-machine diagnosis. |
 | **CVRR Set Reference Latent+** | Chainable `Reference Latent+`: appends one more reference latent to a conditioning and returns it. |
 
 `CVRREditTextEncode` and `CVRRSetReferenceLatent` both write
@@ -87,12 +88,14 @@ LoRA-style attach recommended below) and `klein9b_cvrr_edit.json` (the
 dedicated loader used here).
 
 1. **CVRR Qwen3-VL Text Encoder Loader** → `cvrr/cvrr_qwen3vl_8b-00001.safetensors`,
+   `type = qwen3vl_8b` (the TE architecture combo; 4B/32B variants selectable),
    `mode = aligned`, transition from the same combo (`merged_transition` may be
    any file in `models/text_encoders`, any name; leave empty to auto-pick the
    canonical sibling from a converted release).
 2. Load `flux-2-klein-9b-fp8.safetensors` + `flux2-vae.safetensors` as usual.
-3. **CVRR Edit Text Encode (Klein ref-latent)**: prompt, your image, the VAE, `vl_megapixels ≈ 0.25`
-   (what CVRR sees), `reference_megapixels ≈ 1.0` (what the VAE encodes).
+3. **CVRR Edit Text Encode (Klein ref-latent)**: prompt, your image, the VAE,
+   `ref_longest_edge = 1024` (both the VL input *and* the encoded reference are
+   derived from the same processed image).
 4. `Empty Flux 2 Latent` → **KSampler** (Klein 9B distilled: 4 steps, cfg 1.0)
    → `VAE Decode`.
 
@@ -143,7 +146,7 @@ stock encoder. Two notes:
 ## Tests
 
 ```bash
-COMFYUI_PATH=~/ComfyUI pytest     # 44 tests, CPU only, ~2 GB RAM
+COMFYUI_PATH=~/ComfyUI pytest     # 48 tests, CPU only, ~2 GB RAM
 ```
 
 `COMFYUI_PATH` defaults to `../ComfyUI_src`; without a checkout the

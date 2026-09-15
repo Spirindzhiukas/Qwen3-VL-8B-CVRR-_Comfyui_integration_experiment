@@ -541,7 +541,7 @@ def ensure_cvrr_module(clip, spec: Optional[CVRRSpec] = None):
         raise ValueError("comfyui_cvrr: object has no cond_stage_model; expected a ComfyUI CLIP")
     if isinstance(te, CVRRTE):  # built by build_clip(); already CVRR-capable
         return te
-    model = getattr(te, getattr(te, "clip", ""), None)
+    model = _clip_model_of(te)
     if model is None or not hasattr(model, "transformer"):
         raise ValueError(
             "comfyui_cvrr: unsupported text encoder stack "
@@ -566,10 +566,15 @@ def ensure_cvrr_module(clip, spec: Optional[CVRRSpec] = None):
     text_model.__class__ = CVRRTextModel
     _cvrr_state_defaults(text_model)
     model.__class__ = CVRRQwen3VLClipModel
-    te.__class__ = CVRRTE
-    if isinstance(getattr(model, "layer", None), (list, tuple)):
-        # keep the stock fallback path's intermediate taps aligned with the spec
-        model.layer = list(spec.taps)
+    if isinstance(te, comfy.text_encoders.flux.Flux2TEModel):
+        # Klein: the outer TE hard-codes the 3-tap stacking, so it becomes
+        # CVRRTE (counts match CVRRSpec's 3 taps).
+        te.__class__ = CVRRTE
+        if isinstance(getattr(model, "layer", None), (list, tuple)):
+            model.layer = list(spec.taps)
+    # Other wrappers (e.g. ideogram4's 13-tap TE) keep their outer class: CVRR's
+    # emitted tap count cannot satisfy their reshape anyway, so they stay a
+    # text-only upgrade of the stock encoder (the CVRR plain encode node).
     return te
 
 
@@ -591,13 +596,33 @@ def apply_transition(clip, transition_state_dict, spec: Optional[CVRRSpec] = Non
     mutations of a cached model; attaching the same file twice is a refresh).
     """
     te = ensure_cvrr_module(clip, spec)
-    model = te.clip_model
+    model = _clip_model_of(te)
     model.attach_transition(transition_state_dict, spec=spec)
-    if model.text_model.cvrr_options is not None:
-        model.text_model.configure_cvrr(spec=spec or model.text_model.cvrr_options.spec,
-                                        mode=model.text_model.cvrr_options.mode)
+    text_model = model.transformer
+    if text_model.cvrr_options is not None:
+        text_model.configure_cvrr(spec=spec or text_model.cvrr_options.spec,
+                                  mode=text_model.cvrr_options.mode)
     return te
 
 
+def _clip_model_of(te):
+    """The inner clip model of a (possibly non-Flux2) TE wrapper."""
+    return getattr(te, getattr(te, "clip", ""), None)
+
+
+def _inner_text_model(te):
+    clip_model = _clip_model_of(te)
+    return getattr(clip_model, "transformer", None)
+
+
 def is_cvrr_clip(clip) -> bool:
-    return isinstance(getattr(clip, "cond_stage_model", None), CVRRTE)
+    """True when the clip's text model is CVRR-capable.
+
+    Covers loader-built ``CVRRTE`` stacks *and* retrofits onto non-Flux2
+    wrappers (e.g. ideogram4's ``Ideogram4Qwen3VLTEModel``), where the outer
+    TE class is deliberately preserved.
+    """
+    te = getattr(clip, "cond_stage_model", None)
+    if isinstance(te, CVRRTE):
+        return True
+    return isinstance(_inner_text_model(te), CVRRTextModel)
